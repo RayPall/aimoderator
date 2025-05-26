@@ -179,4 +179,108 @@ with tabs[0]:
         accept_multiple_files=False,
     )
 
-    if uploaded is
+    if uploaded is not None and not st.session_state.upload_processed:
+        with prev_status_ctx("🟣 Odesílám soubor do Whisper…"):
+            st.info("⏳ Zpracovávám nahraný soubor…")
+            transcription = whisper_safe_call(file_like=uploaded, label="upload")
+            if transcription is not None:
+                with prev_status_ctx("🧠 Generuji shrnutí (soubor)…"):
+                    new_pts = summarise_new_points(
+                        transcription, st.session_state.flip_points
+                    )
+                    st.session_state.flip_points.extend(new_pts)
+                st.success("✅ Soubor zpracován – přepněte na záložku Flipchart")
+                st.session_state.upload_processed = True
+
+    # —— ŽIVÝ MIKROFON ————————————————————————————————
+    st.subheader("🎤 Živý mikrofon")
+    webrtc_ctx = webrtc_streamer(
+        key="workshop-audio",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        media_stream_constraints={"audio": True, "video": False},
+    )
+
+    # --- zastavení předchozího vlákna (pokud bylo) --------------------------
+    old_thread = st.session_state.runner_thread
+    if old_thread is not None and old_thread.is_alive():
+        st.session_state.audio_stop_event.set()
+        old_thread.join(timeout=2)
+
+    # --- nový stop_event + vlákno ------------------------------------------
+    stop_evt = threading.Event()
+    st.session_state.audio_stop_event = stop_evt
+
+    async def pipeline_runner(ctx, stop_event: threading.Event):
+        SAMPLE_RATE = 48000
+        bytes_per_sec = SAMPLE_RATE * 2
+        target = AUDIO_BATCH_SECONDS * bytes_per_sec
+
+        while not stop_event.is_set():
+            if not ctx.audio_receiver:
+                set_status("🟡 Čekám na mikrofon…")
+                await asyncio.sleep(0.1)
+                continue
+
+            set_status("🔴 Zachytávám audio…")
+            frames = await ctx.audio_receiver.get_frames(timeout=1)
+            st.session_state.audio_buffer.extend(
+                fr.to_ndarray().tobytes() for fr in frames
+            )
+
+            if sum(len(b) for b in st.session_state.audio_buffer) < target:
+                await asyncio.sleep(0.05)
+                continue
+
+            wav_bytes = pcm_frames_to_wav(st.session_state.audio_buffer)
+            st.session_state.audio_buffer.clear()
+
+            set_status("🟣 Odesílám do Whisper…")
+            transcription = whisper_safe_call(
+                file_like=io.BytesIO(wav_bytes), label="mikrofon"
+            )
+            if transcription is None:
+                await asyncio.sleep(1)
+                continue
+
+            st.session_state.transcript_buffer += " " + transcription
+
+            if len(st.session_state.transcript_buffer.split()) >= 325:
+                set_status("🧠 Generuji shrnutí…")
+                new_pts = summarise_new_points(
+                    st.session_state.transcript_buffer,
+                    st.session_state.flip_points,
+                )
+                st.session_state.flip_points.extend(
+                    [p for p in new_pts if p not in st.session_state.flip_points]
+                )
+                st.session_state.transcript_buffer = ""
+
+            set_status("🟢 Čekám na další dávku…")
+            await asyncio.sleep(0.05)
+
+        set_status("⏹️ Audio vlákno ukončeno")
+
+    t = threading.Thread(
+        target=lambda c=webrtc_ctx, e=stop_evt: asyncio.run(pipeline_runner(c, e)),
+        daemon=True,
+        name="audio-runner",
+    )
+    add_script_run_ctx(t)
+    t.start()
+    st.session_state.runner_thread = t
+
+    # —— SIDEBAR DIAGNOSTIKA ————————————————————————————
+    st.sidebar.header("ℹ️ Stav aplikace")
+    st.sidebar.write("Body na flipchartu:", len(st.session_state.flip_points))
+    st.sidebar.write("Slov v bufferu:", len(st.session_state.transcript_buffer.split()))
+    st.sidebar.subheader("🧭 Stav zpracování")
+    st.sidebar.write(st.session_state.get("status", "❔ Neznámý stav"))
+    st.sidebar.write("Vlákno žije:", t.is_alive())
+
+# ========== TAB 2: Flipchart =================================================
+with tabs[1]:
+    st.components.v1.html(
+        "<script>document.body.classList.add('fullscreen');</script>", height=0
+    )
+    render_flipchart()
