@@ -1,15 +1,18 @@
 # ai_flipchart_streamlit_whisper_api.py
 """
-Streamlit web-app: mikrofon → OpenAI Whisper → ChatGPT → živý Flipchart
+Streamlit web-app: mikrofon → OpenAI Whisper → Make webhook → živý Flipchart
 ---------------------------------------------------------------------------
 
-Funkce
-------
-• Živý mikrofon i testovací upload souboru  
-• Automatické shrnování řeči do odrážek (flipchart)  
-• Diagnostické okno se stavem zpracování + zachytávání chyb API  
-• Vlákno s audio pipeline se korektně ukončí při každém rerunu (žádné
-  'missing ScriptRunContext!' varování)
+Co dělá
+-------
+• Živý mikrofon i testovací upload souboru (WAV/MP3/M4A)  
+• OpenAI Whisper → text přepisu  
+• Přepis + stávající body odešle na Make webhook  
+  (https://hook.eu2.make.com/k08ew9w6ozdfougyjg917nzkypgq24f7)  
+  ➜ Scénář v Make vrátí **JSON pole nových odrážek**  
+• Ty se animovaně doplní na Flipchart  
+• Diagnostické okno se stavem zpracování, robustní zachytávání chyb  
+• Vlákno audio-pipeline se korektně restartuje při každém rerunu
 """
 
 from __future__ import annotations
@@ -24,23 +27,28 @@ import wave
 from typing import List
 
 import numpy as np
+import requests
 import streamlit as st
 from openai import OpenAI, OpenAIError
 from streamlit_webrtc import WebRtcMode, webrtc_streamer
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 
-# ────────────────────── CONFIG ──────────────────────────────────────────────
+# ─────────────────────── CONFIG ────────────────────────────────────────────
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     st.error("Chybí OPENAI_API_KEY – přidejte jej do Secrets / env vars")
     st.stop()
 
+MAKE_WEBHOOK_URL = (
+    "https://hook.eu2.make.com/k08ew9w6ozdfougyjg917nzkypgq24f7"
+)  # <- zde změň, pokud bude jiný
+
 client = OpenAI(api_key=OPENAI_API_KEY)
-AUDIO_BATCH_SECONDS = 160            # kolik sekund audia posíláme najednou
+AUDIO_BATCH_SECONDS = 160  # kolik sekund audia pošleme v jedné dávce do Whisperu
 
 logging.basicConfig(level=logging.INFO)
 
-# ──────────────────── SESSION STATE INIT ───────────────────────────────────
+# ─────────────────── SESSION STATE INIT ────────────────────────────────────
 if "flip_points" not in st.session_state:
     st.session_state.flip_points: List[str] = []
 if "transcript_buffer" not in st.session_state:
@@ -59,13 +67,11 @@ if "runner_thread" not in st.session_state:
 
 # ───────────────────── STATUS HELPERS ──────────────────────────────────────
 def set_status(s: str) -> None:
-    """Přepíše status jen pokud se změnil – šetří log & render."""
     if st.session_state.status != s:
         st.session_state.status = s
 
 @contextlib.contextmanager
-def prev_status_ctx(running: str, done: str | None = None):
-    """Dočasně nastaví stav; po ★yield★ vrátí předchozí (nebo `done`)."""
+def status_ctx(running: str, done: str | None = None):
     prev = st.session_state.status
     set_status(running)
     try:
@@ -73,27 +79,41 @@ def prev_status_ctx(running: str, done: str | None = None):
     finally:
         set_status(done or prev)
 
-def whisper_safe_call(*, file_like, label: str) -> str | None:
-    """
-    Zavolá Whisper. Při chybě zaloguje, informuje uživatele a vrátí None.
-    `label` → upload / mikrofon – zobrazí se v diagnostice.
-    """
+def whisper_safe(file_like, label: str) -> str | None:
+    """Volá Whisper; při chybě zaloguje, zobrazí a vrátí None."""
     try:
-        return client.audio.transcriptions.create(
-            model="whisper-1",
-            file=file_like,
-            language="cs",
-        ).text
+        return (
+            client.audio.transcriptions.create(
+                model="whisper-1", file=file_like, language="cs"
+            ).text
+        )
     except OpenAIError as e:
-        # plný traceback do logu
         logging.exception("Whisper API error (%s)", label)
         set_status(f"❌ Chyba Whisperu ({label})")
         st.error(
-            "❌ Whisper API vrátilo chybu.\n"
-            "• Zkontroluj formát/velikost souboru a kredit účtu.\n\n"
+            "❌ Whisper API vrátilo chybu – zkontroluj formát/velikost souboru "
+            "a kredit účtu.\n\n"
             f"Typ chyby: **{e.__class__.__name__}**"
         )
         return None
+
+def call_make_webhook(transcript: str, existing: list[str]) -> list[str]:
+    """Pošle JSON na Make, vrátí list nových bodů (nebo prázdný)."""
+    payload = {"transcript": transcript, "existing": existing}
+    try:
+        r = requests.post(MAKE_WEBHOOK_URL, json=payload, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            logging.error("Webhook nevrátil list: %s", data)
+            set_status("⚠️ Neplatná odpověď webhooku")
+            return []
+        return [str(p).strip() for p in data if str(p).strip()]
+    except Exception as e:
+        logging.exception("Chyba při volání Make webhooku")
+        set_status("❌ Chyba webhooku")
+        st.error(f"❌ Chyba při volání Make scénáře: {e}")
+        return []
 
 # ───────────────────────── CSS ─────────────────────────────────────────────
 STYLES = """
@@ -123,8 +143,7 @@ def render_flipchart() -> None:
         unsafe_allow_html=True,
     )
 
-def pcm_frames_to_wav(frames: list[bytes], sample_rate: int = 48000) -> bytes:
-    """Sloučí PCM rámce na WAV (mono, 16-bit)."""
+def pcm_frames_to_wav(frames: list[bytes], sr: int = 48000) -> bytes:
     if not frames:
         return b""
     pcm = np.frombuffer(b"".join(frames), dtype=np.int16)
@@ -132,67 +151,40 @@ def pcm_frames_to_wav(frames: list[bytes], sample_rate: int = 48000) -> bytes:
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
-            wf.setframerate(sample_rate)
+            wf.setframerate(sr)
             wf.writeframes(pcm.tobytes())
         buf.seek(0)
         return buf.read()
 
-PROMPT = """
-Jsi zkušený moderátor workshopu FWB Summit 2025 …
-Tvým úkolem je shrnovat projev do klíčových myšlenek:
-NADPIS
-- bod
-- bod
-Vracíš pouze NOVÉ body jako JSON pole.
-"""
-
-def summarise_new_points(text: str, existing: list[str]) -> list[str]:
-    msgs = [
-        {"role": "system",    "content": PROMPT},
-        {"role": "user",      "content": text},
-        {"role": "assistant", "content": json.dumps(existing, ensure_ascii=False)},
-    ]
-    raw = client.chat.completions.create(
-        model="gpt-3.5-turbo-1106", temperature=0.2, messages=msgs
-    ).choices[0].message.content
-    try:
-        pts = json.loads(raw)
-        if not isinstance(pts, list):
-            raise ValueError
-        return [p.strip() for p in pts if p.strip()]
-    except Exception:
-        # fallback – prosté rozparsování odrážek
-        return [ln.lstrip("-• ").strip() for ln in raw.splitlines() if ln.strip()]
-
-# ─────────────────────── UI LAYOUT ─────────────────────────────────────────
+# ───────────────────── UI LAYOUT ───────────────────────────────────────────
 st.set_page_config(page_title="AI Flipchart", layout="wide")
 tabs = st.tabs(["🛠 Ovládání", "📝 Flipchart"])
 
-# ========== TAB 1: Ovládání ==================================================
+# ========== TAB 1: Ovládání ================================================
 with tabs[0]:
     st.header("Nastavení a vstup zvuku")
 
-    # —— TESTOVACÍ UPLOAD ————————————————————————————————
+    # —— TESTOVACÍ UPLOAD ——————————————————————————
     uploaded = st.file_uploader(
         "▶️ Nahrajte WAV/MP3 k otestování (max pár minut)",
         type=["wav", "mp3", "m4a"],
         accept_multiple_files=False,
     )
-
     if uploaded is not None and not st.session_state.upload_processed:
-        with prev_status_ctx("🟣 Odesílám soubor do Whisper…"):
+        with status_ctx("🟣 Odesílám soubor do Whisper…"):
             st.info("⏳ Zpracovávám nahraný soubor…")
-            transcription = whisper_safe_call(file_like=uploaded, label="upload")
-            if transcription is not None:
-                with prev_status_ctx("🧠 Generuji shrnutí (soubor)…"):
-                    new_pts = summarise_new_points(
-                        transcription, st.session_state.flip_points
+            transcription = whisper_safe(uploaded, label="upload")
+            if transcription:
+                with status_ctx("🧠 Volám Make webhook…"):
+                    new_pts = call_make_webhook(
+                        transcript=transcription,
+                        existing=st.session_state.flip_points,
                     )
                     st.session_state.flip_points.extend(new_pts)
                 st.success("✅ Soubor zpracován – přepněte na záložku Flipchart")
                 st.session_state.upload_processed = True
 
-    # —— ŽIVÝ MIKROFON ————————————————————————————————
+    # —— ŽIVÝ MIKROFON ———————————————————————————
     st.subheader("🎤 Živý mikrofon")
     webrtc_ctx = webrtc_streamer(
         key="workshop-audio",
@@ -201,13 +193,12 @@ with tabs[0]:
         media_stream_constraints={"audio": True, "video": False},
     )
 
-    # --- zastavení předchozího vlákna (pokud bylo) --------------------------
-    old_thread = st.session_state.runner_thread
-    if old_thread is not None and old_thread.is_alive():
+    # — zastav předchozí vlákno (při rerunu) —
+    old_t = st.session_state.runner_thread
+    if old_t and old_t.is_alive():
         st.session_state.audio_stop_event.set()
-        old_thread.join(timeout=2)
+        old_t.join(timeout=2)
 
-    # --- nový stop_event + vlákno ------------------------------------------
     stop_evt = threading.Event()
     st.session_state.audio_stop_event = stop_evt
 
@@ -227,7 +218,6 @@ with tabs[0]:
             st.session_state.audio_buffer.extend(
                 fr.to_ndarray().tobytes() for fr in frames
             )
-
             if sum(len(b) for b in st.session_state.audio_buffer) < target:
                 await asyncio.sleep(0.05)
                 continue
@@ -236,20 +226,18 @@ with tabs[0]:
             st.session_state.audio_buffer.clear()
 
             set_status("🟣 Odesílám do Whisper…")
-            transcription = whisper_safe_call(
-                file_like=io.BytesIO(wav_bytes), label="mikrofon"
-            )
-            if transcription is None:
+            transcription = whisper_safe(io.BytesIO(wav_bytes), label="mikrofon")
+            if not transcription:
                 await asyncio.sleep(1)
                 continue
 
             st.session_state.transcript_buffer += " " + transcription
 
             if len(st.session_state.transcript_buffer.split()) >= 325:
-                set_status("🧠 Generuji shrnutí…")
-                new_pts = summarise_new_points(
-                    st.session_state.transcript_buffer,
-                    st.session_state.flip_points,
+                set_status("🧠 Volám Make webhook…")
+                new_pts = call_make_webhook(
+                    transcript=st.session_state.transcript_buffer,
+                    existing=st.session_state.flip_points,
                 )
                 st.session_state.flip_points.extend(
                     [p for p in new_pts if p not in st.session_state.flip_points]
@@ -270,7 +258,7 @@ with tabs[0]:
     t.start()
     st.session_state.runner_thread = t
 
-    # —— SIDEBAR DIAGNOSTIKA ————————————————————————————
+    # —— SIDEBAR DIAGNOSTIKA ————————————————————
     st.sidebar.header("ℹ️ Stav aplikace")
     st.sidebar.write("Body na flipchartu:", len(st.session_state.flip_points))
     st.sidebar.write("Slov v bufferu:", len(st.session_state.transcript_buffer.split()))
@@ -278,7 +266,7 @@ with tabs[0]:
     st.sidebar.write(st.session_state.get("status", "❔ Neznámý stav"))
     st.sidebar.write("Vlákno žije:", t.is_alive())
 
-# ========== TAB 2: Flipchart =================================================
+# ========== TAB 2: Flipchart ===============================================
 with tabs[1]:
     st.components.v1.html(
         "<script>document.body.classList.add('fullscreen');</script>", height=0
