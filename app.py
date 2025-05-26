@@ -83,8 +83,21 @@ def pcm_frames_to_wav(frames: list[bytes], sample_rate: int = 48000) -> bytes:
 def summarise_new_points(text: str, existing: list[str]) -> list[str]:
     """LLM vrátí nové bullet‑points (JSON pole)."""
     sys = (
-        "Jsi moderátor českého workshopu. Z textu vyber NOVÉ klíčové myšlenky, "
-        "každou max 12 slov. Vrať JSON pole. Body, které už jsou na flipchartu, ignoruj."
+        "Jsi zkušený moderátor workshopu FWB Summit 2025. Cholné setkání podnikatelských rodin, "
+        "expertů, akademiků a politiků, kteří sdílí zkušenosti a formují budoucnost rodinného podnikání. "
+        "Akce hostí světové i domácí osobnosti a nabízí unikátní prostor pro inspiraci, inovace a spolupráci.
+
+"
+        "Tvým úkolem je shrnovat projev do klíčových myšlenek. Myšlenky piš v následujícím formátu:
+"
+        "NADPIS MYŠLENKY
+- detail 1
+- detail 2
+- detail 3
+- atp.
+
+"
+        "Z textu vyber NOVÉ klíčové myšlenky. Vrať JSON pole. Body, které už jsou na flipchartu, ignoruj."
     )
     msgs = [
         {"role": "system", "content": sys},
