@@ -100,10 +100,11 @@ expertů, akademiků a politiků, kteří sdílí zkušenosti a formují budoucn
 podnikání.
 
 Tvým úkolem je shrnovat projev do klíčových myšlenek v tomto formátu:
-NADPIS MYŠLENKY
+
+"NADPIS MYŠLENKY
 - detail 1
 - detail 2
-- detail 3
+- detail 3"
 […]
 
 Z textu vyber **nové** klíčové myšlenky a vrať je jako JSON pole. Body, které už jsou
