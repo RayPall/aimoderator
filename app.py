@@ -78,4 +78,63 @@ def render_flipchart() -> None:
     if not points:
         st.info("Čekám na první shrnutí…")
         return
-    bull
+    bullets = "<ul class='flipchart'>" + "".join(
+        [f"<li style='animation-delay:{i*0.1}s'>{p}</li>" for i, p in enumerate(points)]
+    ) + "</ul>"
+    st.markdown(bullets, unsafe_allow_html=True)
+
+
+def pcm_frames_to_wav(frames: list[bytes], sample_rate: int = 48000) -> bytes:
+    if not frames:
+        return b""
+    pcm = np.frombuffer(b"".join(frames), dtype=np.int16)
+    with io.BytesIO() as buf:
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm.tobytes())
+        buf.seek(0)
+        return buf.read()
+
+
+PROMPT = """
+Jsi zkušený moderátor workshopu FWB Summit 2025. Cholné setkání podnikatelských rodin, expertů, akademiků a politiků, kteří sdílí zkušenosti a formují budoucnost rodinného podnikání. Akce hostí světové i domácí osobnosti a nabízí unikátní prostor pro inspiraci, inovace a spolupráci.
+
+Tvým úkolem je shrnovat projev do klíčových myšlenek. Myšlenky piš v následujícím formátu:
+NADPIS MYŠLENKY
+- detail 1
+- detail 2
+- detail 3
+- atp.
+
+Z textu vyber NOVÉ klíčové myšlenky. Vrať JSON pole. Body, které už jsou na flipchartu, ignoruj.
+"""
+
+
+def summarise_new_points(text: str, existing: list[str]) -> list[str]:
+    msgs = [
+        {"role": "system", "content": PROMPT},
+        {"role": "user", "content": text},
+        {"role": "assistant", "content": json.dumps(existing, ensure_ascii=False)},
+    ]
+    raw = client.chat.completions.create(
+        model="gpt-3.5-turbo-1106", temperature=0.2, messages=msgs
+    ).choices[0].message.content
+    try:
+        pts = json.loads(raw)
+        if not isinstance(pts, list):
+            raise ValueError
+        return [p.strip() for p in pts if p.strip()]
+    except Exception:
+        return [ln.lstrip("-• ").strip() for ln in raw.splitlines() if ln.strip()]
+
+# ─────────── STREAMLIT LAYOUT (tabs) ───────────
+st.set_page_config(layout="wide", page_title="AI Flipchart")
+
+tabs = st.tabs(["🛠 Ovládání", "📝 Flipchart"])
+
+# ========== Tab 1: OVLÁDÁNÍ ==========
+with tabs[0]:
+    st.header("Nastavení a vstup zvuku")
+    uploaded = st.file_uploader("▶️ Nahrajte WAV/MP3 k otestování (max pár minut)",
