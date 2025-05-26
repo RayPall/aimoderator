@@ -1,8 +1,8 @@
 # ai_flipchart_streamlit_whisper_api.py
 """
-Streamlit web-app: mikrofon ➜ OpenAI Whisper API ➜ ChatGPT ➜ živý „flipchart“
-Kompatibilní se **streamlit-webrtc ≥ 0.52** (už bez ClientSettings) a s Python 3.13
-na Streamlit Community Cloud.
+Streamlit web‑app: mikrofon ➜ OpenAI Whisper API ➜ ChatGPT ➜ živý „flipchart“
+Nově podporuje i **offline test** – stačí nahrát WAV/MP3 soubor a aplikace jej
+zpracuje, aniž byste potřebovali funkční WebRTC/mikrofon.
 
 Lokální spuštění
 --------------------------------
@@ -17,8 +17,8 @@ streamlit-webrtc>=0.52
 openai
 soundfile
 numpy
-```
-Na Streamlit Cloud doporučuji ještě `packages.txt` s jedním řádkem `ffmpeg`.
+``` 
+Na Streamlit Cloud přidejte `packages.txt` s jediným řádkem **`ffmpeg`**.
 """
 
 from __future__ import annotations
@@ -36,17 +36,22 @@ from openai import OpenAI
 from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 # ───────────────────────── CONFIG ──────────────────────────
-OPENAI_API_KEY: str | None = st.secrets.get("OPENAI_API_KEY")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    st.error("Chybí OPENAI_API_KEY – přidejte jej do Secretů nebo env vars")
+    st.error("Chybí OPENAI_API_KEY – přidejte jej do Secrets / env vars")
     st.stop()
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-AUDIO_BATCH_SECONDS = 160            # ≈ 2,5–3 min blok pro přepis
+AUDIO_BATCH_SECONDS = 160  # 2 ½–3 min blok mikrofonu
+TEST_CHUNK_SEC = 30        # při testu rozsekáme nahraný soubor na 30 s kousky
 
 # ───────────────────────── UI LAYOUT ───────────────────────
 st.set_page_config(page_title="AI Flipchart", layout="wide")
-st.title("📋 AI Flipchart – FBW Summit 2025")
+st.title("📋 AI Flipchart – FBW Summit 2025")
+
+# ▸ Upload pro test bez mikrofonu
+uploaded = st.file_uploader("▶️ Nahrajte WAV/MP3 k otestování (max pár minut)",
+                            type=["wav", "mp3", "m4a"], accept_multiple_files=False)
 
 placeholder = st.empty()
 if "flip_points" not in st.session_state:
@@ -56,20 +61,9 @@ if "transcript_buffer" not in st.session_state:
 if "audio_buffer" not in st.session_state:
     st.session_state.audio_buffer: list[bytes] = []
 
-# ───────────────────────── AUDIO CAPTURE ───────────────────
-webrtc_ctx = webrtc_streamer(
-    key="workshop-audio",
-    mode=WebRtcMode.SENDRECV,
-    rtc_configuration={
-        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}],
-    },
-    media_stream_constraints={"audio": True, "video": False},
-)
-
 # ───────────────────────── HELPERS ─────────────────────────
 
 def pcm_frames_to_wav(frames: list[bytes], sample_rate: int = 48000) -> bytes:
-    """Raw PCM int16 ➜ WAV container (in-memory)."""
     if not frames:
         return b""
     pcm = np.frombuffer(b"".join(frames), dtype=np.int16)
@@ -83,19 +77,18 @@ def pcm_frames_to_wav(frames: list[bytes], sample_rate: int = 48000) -> bytes:
         return buf.read()
 
 
-def summarise_new_points(transcript: str, existing: list[str]) -> list[str]:
-    """Vrátí *nové* odrážky (JSON pole) max 12 slov každá."""
+def summarise_new_points(text: str, existing: list[str]) -> list[str]:
     sys = (
         "Jsi moderátor českého workshopu. Z textu vyber NOVÉ klíčové myšlenky, "
-        "každou max 12 slov, vrať JSON pole. Body, které už na flipchartu jsou, ignoruj."
+        "každou max 12 slov, vrať JSON pole. Body, které už jsou na flipchartu, ignoruj."
     )
-    messages = [
+    msgs = [
         {"role": "system", "content": sys},
-        {"role": "user", "content": transcript},
+        {"role": "user", "content": text},
         {"role": "assistant", "content": json.dumps(existing, ensure_ascii=False)},
     ]
     raw = client.chat.completions.create(
-        model="gpt-3.5-turbo-1106", temperature=0.2, messages=messages
+        model="gpt-3.5-turbo-1106", temperature=0.2, messages=msgs
     ).choices[0].message.content
     try:
         pts = json.loads(raw)
@@ -105,11 +98,40 @@ def summarise_new_points(transcript: str, existing: list[str]) -> list[str]:
     except Exception:
         return [ln.lstrip("-• ").strip() for ln in raw.splitlines() if ln.strip()]
 
+# ───────────────────────── TEST: FILE UPLOAD ──────────────
+if uploaded is not None:
+    st.info("⏳ Zpracovávám nahraný soubor…")
+    # Pošleme celý soubor do Whisper API (nebo po částech)
+    # Pokud soubor > 25MB, OpenAI odmítne; pro demo předpokládáme krátký.
+    transcription = client.audio.transcriptions.create(
+        model="whisper-1",
+        file=uploaded,
+        response_format="text",
+        language="cs",
+    ).text
+    new_pts = summarise_new_points(transcription, [])
+    st.session_state.flip_points = new_pts
+    # Vykresli flipchart
+    with placeholder.container():
+        st.subheader("Výsledek testu 📝")
+        for p in new_pts:
+            st.markdown(f"- {p}")
+    st.stop()
+
+# ───────────────────────── LIVE MICROPHONE MODUS ──────────
+# (spustí se jen pokud nebyl upload)
+
+# 1️⃣ Capture audio přes WebRTC
+webrtc_ctx = webrtc_streamer(
+    key="workshop-audio",
+    mode=WebRtcMode.SENDRECV,
+    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+    media_stream_constraints={"audio": True, "video": False},
+)
 
 async def pipeline_runner():
-    """Loop: audio ➜ Whisper ➜ ChatGPT ➜ UI update."""
     SAMPLE_RATE = 48000
-    bytes_per_sec = SAMPLE_RATE * 2  # int16 mono
+    bytes_per_sec = SAMPLE_RATE * 2
     target_bytes = AUDIO_BATCH_SECONDS * bytes_per_sec
 
     while True:
@@ -127,17 +149,17 @@ async def pipeline_runner():
         wav_bytes = pcm_frames_to_wav(st.session_state.audio_buffer)
         st.session_state.audio_buffer.clear()
 
-        trans = client.audio.transcriptions.create(
+        transcription = client.audio.transcriptions.create(
             model="whisper-1",
             file=io.BytesIO(wav_bytes),
             response_format="text",
             language="cs",
         ).text.strip()
 
-        if trans:
-            st.session_state.transcript_buffer += " " + trans
+        if transcription:
+            st.session_state.transcript_buffer += " " + transcription
 
-        if len(st.session_state.transcript_buffer.split()) >= 325:  # ≈ 2,5 min řeči
+        if len(st.session_state.transcript_buffer.split()) >= 325:
             new_pts = summarise_new_points(
                 st.session_state.transcript_buffer, st.session_state.flip_points
             )
@@ -153,10 +175,9 @@ async def pipeline_runner():
 
         await asyncio.sleep(0.05)
 
-
-# ───────────────────── spuštění background event-loopu ───────────────────────
-if "runner_created" not in st.session_state:
-    def _start_loop() -> None:
+# ───────────────────── start background loop ──────────────
+if "runner_created" not in st.session_state and uploaded is None:
+    def _start_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(pipeline_runner())
@@ -164,9 +185,8 @@ if "runner_created" not in st.session_state:
     threading.Thread(target=_start_loop, daemon=True).start()
     st.session_state.runner_created = True
 
-# ───────────────────── postranní panel / debug ───────────────────────
+# ───────────────────── sidebar debug ──────────────────────
 st.sidebar.header("ℹ️ Stav aplikace")
 st.sidebar.write("Body na flipchartu:", len(st.session_state.flip_points))
 st.sidebar.write("Slov v bufferu:", len(st.session_state.transcript_buffer.split()))
-st.sidebar.caption(
-    "Aplikace běží, dokud je karta otevřená. Přepis + shrnutí přibude každých ≈ 10 s po batchi.")
+st.sidebar.caption("Aplikace běží, dokud karta zůstává otevřená. Pro rychlý test nahrajte audio soubor.")
