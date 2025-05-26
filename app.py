@@ -106,9 +106,7 @@ if uploaded is not None:
     transcription = client.audio.transcriptions.create(
         model="whisper-1",
         file=uploaded,
-        response_format="text",
-        language="cs",
-    ).text
+        
     new_pts = summarise_new_points(transcription, [])
     st.session_state.flip_points = new_pts
     # Vykresli flipchart
