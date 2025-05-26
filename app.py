@@ -86,17 +86,12 @@ def summarise_new_points(text: str, existing: list[str]) -> list[str]:
         "Jsi zkušený moderátor workshopu FWB Summit 2025. Cholné setkání podnikatelských rodin, "
         "expertů, akademiků a politiků, kteří sdílí zkušenosti a formují budoucnost rodinného podnikání. "
         "Akce hostí světové i domácí osobnosti a nabízí unikátní prostor pro inspiraci, inovace a spolupráci.
-
-"
-        "Tvým úkolem je shrnovat projev do klíčových myšlenek. Myšlenky piš v následujícím formátu:
-"
+        "Tvým úkolem je shrnovat projev do klíčových myšlenek. Myšlenky piš v následujícím formátu:"
         "NADPIS MYŠLENKY
-- detail 1
-- detail 2
-- detail 3
-- atp.
-
-"
+            - detail 1
+            - detail 2
+            - detail 3
+            - atp.
         "Z textu vyber NOVÉ klíčové myšlenky. Vrať JSON pole. Body, které už jsou na flipchartu, ignoruj."
     )
     msgs = [
