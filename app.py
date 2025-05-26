@@ -1,31 +1,31 @@
 # ai_flipchart_streamlit_whisper_api.py
 """
-Streamlit web-app: mikrofon → OpenAI Whisper → ChatGPT → živý **Flipchart**
+Streamlit web‑app: mikrofon → OpenAI Whisper → ChatGPT → živý Flipchart
 ---------------------------------------------------------------------------
+
 Novinky
 =======
-1. **Animované vplynutí (fade-in) bodů** – každá nová odrážka se objeví s jemným
-   průletem/iz-fade-in.
-2. **Záložky (tabs)** – nahoře jsou dvě karty:
-      * **Ovládání** – zachytává audio / upload souboru.
-      * **Flipchart** – fullscreen náhled (skryje záhlaví, menu i padding).
+1. Animované vplynutí (fade‑in) bodů – každá nová odrážka se objeví s jemným průletem/iz‑fade‑in.
+2. Záložky (tabs) – nahoře jsou dvě karty:
+      * Ovládání – zachytává audio / upload souboru.
+      * Flipchart – fullscreen náhled (skryje záhlaví, menu i padding).
 
 Lokální spuštění
 ----------------
-```bash
 pip install -r requirements.txt
 streamlit run ai_flipchart_streamlit_whisper_api.py
-```
-`requirements.txt`
-```
+
+requirements.txt
+----------------
 streamlit
 streamlit-webrtc>=0.52
 openai
 soundfile
 numpy
-```
-Na Streamlit Cloud navíc `packages.txt` s řádkem `ffmpeg`.
+
+Na Streamlit Cloud navíc `packages.txt` s řádkem `ffmpeg`.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -56,14 +56,15 @@ if "transcript_buffer" not in st.session_state:
     st.session_state.transcript_buffer = ""
 if "audio_buffer" not in st.session_state:
     st.session_state.audio_buffer: list[bytes] = []
+if "status" not in st.session_state:
+    st.session_state.status = "🟡 Čekám na mikrofon…"
 
-# ─────────── CSS (fade-in + fullscreen) ───────────
+# ─────────── CSS (fade‑in + fullscreen) ───────────
 STYLES = """
 <style>
 ul.flipchart {list-style-type:none; padding-left:0;}
 ul.flipchart li {opacity:0; transform:translateY(8px); animation:fadeIn 0.45s forwards;}
 @keyframes fadeIn {to {opacity:1; transform:translateY(0);}}
-/* Fullscreen */
 .fullscreen header, .fullscreen #MainMenu, .fullscreen footer {visibility:hidden;}
 .fullscreen .block-container {padding-top:0.5rem;}
 </style>
@@ -72,7 +73,6 @@ ul.flipchart li {opacity:0; transform:translateY(8px); animation:fadeIn 0.45s fo
 # ─────────── HELPERS ───────────
 
 def render_flipchart() -> None:
-    """Vykreslí flipchart s animací do st.container()"""
     st.markdown(STYLES, unsafe_allow_html=True)
     points = st.session_state.flip_points
     if not points:
@@ -111,7 +111,6 @@ NADPIS MYŠLENKY
 Z textu vyber NOVÉ klíčové myšlenky. Vrať JSON pole. Body, které už jsou na flipchartu, ignoruj.
 """
 
-
 def summarise_new_points(text: str, existing: list[str]) -> list[str]:
     msgs = [
         {"role": "system", "content": PROMPT},
@@ -137,4 +136,74 @@ tabs = st.tabs(["🛠 Ovládání", "📝 Flipchart"])
 # ========== Tab 1: OVLÁDÁNÍ ==========
 with tabs[0]:
     st.header("Nastavení a vstup zvuku")
-    uploaded = st.file_uploader("▶️ Nahrajte WAV/MP3 k otestování (max pár minut)"),
+    uploaded = st.file_uploader("▶️ Nahrajte WAV/MP3 k otestování (max pár minut)",
+                                type=["wav", "mp3", "m4a"], accept_multiple_files=False)
+
+    if uploaded is not None:
+        st.info("⏳ Zpracovávám nahraný soubor…")
+        transcription = client.audio.transcriptions.create(
+            model="whisper-1", file=uploaded, language="cs"
+        ).text
+        st.session_state.flip_points.extend(summarise_new_points(transcription, []))
+        st.success("Hotovo – přepněte na záložku Flipchart")
+        st.stop()
+
+    st.subheader("🎤 Živý mikrofon")
+    webrtc_ctx = webrtc_streamer(
+        key="workshop-audio",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        media_stream_constraints={"audio": True, "video": False},
+    )
+
+    async def pipeline_runner():
+        SAMPLE_RATE = 48000
+        bytes_per_sec = SAMPLE_RATE * 2
+        target_bytes = AUDIO_BATCH_SECONDS * bytes_per_sec
+        while True:
+            if not webrtc_ctx.audio_receiver:
+                st.session_state.status = "🟡 Čekám na mikrofon…"
+                await asyncio.sleep(0.1)
+                continue
+            st.session_state.status = "🔴 Zachytávám audio…"
+            frames = await webrtc_ctx.audio_receiver.get_frames(timeout=1)
+            st.session_state.audio_buffer.extend(fr.to_ndarray().tobytes() for fr in frames)
+            if sum(len(b) for b in st.session_state.audio_buffer) < target_bytes:
+                await asyncio.sleep(0.05)
+                continue
+            st.session_state.status = "🟣 Odesílám do Whisper…"
+            wav_bytes = pcm_frames_to_wav(st.session_state.audio_buffer)
+            st.session_state.audio_buffer.clear()
+            transcription = client.audio.transcriptions.create(
+                model="whisper-1", file=io.BytesIO(wav_bytes), language="cs"
+            ).text
+            st.session_state.transcript_buffer += " " + transcription
+            if len(st.session_state.transcript_buffer.split()) >= 325:
+                st.session_state.status = "🧠 Generuji shrnutí…"
+                new_pts = summarise_new_points(
+                    st.session_state.transcript_buffer, st.session_state.flip_points
+                )
+                st.session_state.flip_points.extend(
+                    [p for p in new_pts if p not in st.session_state.flip_points]
+                )
+                st.session_state.transcript_buffer = ""
+            st.session_state.status = "🟢 Čekám na další dávku…"
+            await asyncio.sleep(0.05)
+
+    if "runner_created" not in st.session_state:
+        threading.Thread(target=lambda: asyncio.run(pipeline_runner()), daemon=True).start()
+        st.session_state.runner_created = True
+
+    # Debug panel
+    st.sidebar.header("ℹ️ Stav aplikace")
+    st.sidebar.write("Body na flipchartu:", len(st.session_state.flip_points))
+    st.sidebar.write("Slov v bufferu:", len(st.session_state.transcript_buffer.split()))
+    st.sidebar.subheader("🧭 Stav zpracování")
+    st.sidebar.write(st.session_state.get("status", "❔ Neznámý stav"))
+
+# ========== Tab 2: FLIPCHART ==========
+with tabs[1]:
+    st.components.v1.html(
+        """<script>document.body.classList.add('fullscreen');</script>""", height=0
+    )
+    render_flipchart()
