@@ -137,4 +137,4 @@ tabs = st.tabs(["🛠 Ovládání", "📝 Flipchart"])
 # ========== Tab 1: OVLÁDÁNÍ ==========
 with tabs[0]:
     st.header("Nastavení a vstup zvuku")
-    uploaded = st.file_uploader("▶️ Nahrajte WAV/MP3 k otestování (max pár minut)",
+    uploaded = st.file_uploader("▶️ Nahrajte WAV/MP3 k otestování (max pár minut)"),
