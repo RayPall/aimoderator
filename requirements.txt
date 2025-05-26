@@ -1,5 +1,7 @@
-streamlit
-streamlit-webrtc
+streamlit==1.34
+streamlit-webrtc==0.46.1   # poslední release, kompatibilní se Streamlit 1.34
 openai
 soundfile
 numpy
+aiortc==1.6.0              # jen pro jistotu, st-webrtc ji stejně natáhne
+av==10.0.0                 # binární wheel existuje → žádná kompilace
