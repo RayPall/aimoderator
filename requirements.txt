@@ -1,7 +1,5 @@
-streamlit==1.45.0        # aktuální stabilní verze :contentReference[oaicite:0]{index=0}
-streamlit-webrtc==0.48.0 # komponenta pro audio/video stream :contentReference[oaicite:1]{index=1}
-openai-whisper==2025.5.15
-torch>=2.2
+streamlit
+streamlit-webrtc
+openai
+soundfile
 numpy
-sounddevice
-openai>=1.30  # jen pokud chcete sumarizovat GPT-4o
