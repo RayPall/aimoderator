@@ -93,8 +93,7 @@ with col_left:
             pass                      # pokud nestíháme, starý dropneme
         return f
 
-    webrtc_streamer(
-        key="mic",
+    webrtc_streamer( key="mic",
         mode=WebRtcMode.SENDONLY,
         in_audio_callback=audio_cb,          # ✓ okamžitě vybírá frame
         rtc_configuration={"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]},
