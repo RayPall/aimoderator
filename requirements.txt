@@ -6,4 +6,4 @@ fastapi
 uvicorn
 soundfile
 numpy
-pip install streamlit-extras
+streamlit-extras
