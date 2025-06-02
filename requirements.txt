@@ -6,4 +6,4 @@ fastapi
 uvicorn
 soundfile
 numpy
-streamlit_extras.app_autorefresh
+streamlit_extras
