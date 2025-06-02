@@ -1,4 +1,5 @@
 streamlit
+streamlit-extras
 streamlit-webrtc>=0.52
 openai
 requests
@@ -6,4 +7,3 @@ fastapi
 uvicorn
 soundfile
 numpy
-streamlit-extras
