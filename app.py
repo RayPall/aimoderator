@@ -1,292 +1,153 @@
-# ai_flipchart_streamlit_whisper_api.py
+# ai_moderator.py
 """
-Streamlit → OpenAI Whisper → Make → Flipchart
---------------------------------------------
-•  Mikrofon / upload přepisujeme přes OpenAI Whisper.
-•  Přepis posíláme na Make webhook, který vrací pole nových bodů.
-•  Flipchart zobrazuje NADPIS tučně, podbody jako seznam s puntíky.
-•  Indikátor zvuku v sidebaru („🎙️ Zvuk přijímán / 🟡 Žádný zvuk“).
-•  Volitelný tester mikrofonu – nahraje 3 s a ihned přehraje WAV.
+Minimalistická verze
+====================
+✓ Zachytává živý mikrofon (WebRTC SENDONLY)  
+✓ Nepřetržitě přepisuje přes OpenAI Whisper (bloky 5 s)  
+✓ Každých 60 s odešle sebraný přepis na Make; odpovědí jsou bullet-points  
+✓ Flipchart okamžitě zobrazuje vrácené body  
+✓ Lišta „Live Transcript“ ukazuje průběžný text
+
+Požadavky (pip):
+    streamlit
+    streamlit-webrtc
+    openai
+    numpy
+    requests
 """
 
 from __future__ import annotations
-
-import asyncio
-import contextlib
-import io
-import logging
-import queue as q
-import re
-import threading
-import time
-import wave
-
-import numpy as np
-import requests
-import streamlit as st
+import asyncio, io, queue, threading, time, re, wave
+import numpy as np, streamlit as st, requests
 from openai import OpenAI, OpenAIError
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
-# ══════════ KONFIGURACE ═════════════════════════════════════════════════
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    st.error("Chybí OPENAI_API_KEY – přidejte jej do Secrets")
-    st.stop()
-
+# ────────── Nastavení ───────────────────────────────────────────────────
+OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-AUDIO_BLOCK_SEC = 5         # kolik sekund posíláme naráz do Whisper
-RECEIVER_SIZE   = 1024      # fronta streamlit-webrtc (~20 s audia)
+MAKE_URL        = "https://hook.eu2.make.com/k08ew9w6ozdfougyjg917nzkypgq24f7"
+WEBHOOK_TOKEN   = st.secrets.get("WEBHOOK_OUT_TOKEN", "out-token")
+SAMPLE_RATE     = 48_000
+RECEIVER_SIZE   = 1024          # ~20 s puffer
+WHISPER_BLOCK_S = 5
+MAKE_INTERVAL_S = 60
 
-MAKE_WEBHOOK_URL  = "https://hook.eu2.make.com/k08ew9w6ozdfougyjg917nzkypgq24f7"
-WEBHOOK_OUT_TOKEN = st.secrets.get("WEBHOOK_OUT_TOKEN", "out-token")
-
-logging.basicConfig(level=logging.INFO)
-
-# ══════════ STAV STRÁNKY ════════════════════════════════════════════════
+# ────────── Stav Streamlit ──────────────────────────────────────────────
 s = st.session_state
 for k, v in {
-    "flip_points":      [],
-    "transcript_buffer": "",
-    "audio_buffer":     [],
-    "status":           "🟡 Čekám na mikrofon…",
-    "upload_processed": False,
-    "audio_stop_event": None,
-    "runner_thread":    None,
-    "last_frame_time":  0.0,
-    "test_wav":         b"",
+    "live_text":    "",          # průběžný text
+    "flip_points":  [],
+    "audio_buf":    [],          # PCM rámce
+    "last_make":    time.time(),
 }.items():
     s.setdefault(k, v)
 
-def set_status(t: str) -> None:
-    s.status = t
-
-@contextlib.contextmanager
-def status_ctx(running: str, done: str | None = None):
-    prev = s.status
-    set_status(running)
-    try:
-        yield
-    finally:
-        set_status(done or prev)
-
-# ══════════ WHISPER & MAKE ══════════════════════════════════════════════
-def whisper_safe(buf: io.BytesIO | io.BufferedReader, label: str) -> str | None:
-    try:
-        return client.audio.transcriptions.create(
-            model="whisper-1", file=buf, language="cs"
-        ).text
-    except OpenAIError as exc:
-        logging.exception("Whisper error (%s)", label)
-        st.error(f"❌ Whisper API: {exc}")
-        return None
-
-def call_make(transcript: str, existing: list[str]) -> list[str]:
-    try:
-        r = requests.post(
-            MAKE_WEBHOOK_URL,
-            json={"token": WEBHOOK_OUT_TOKEN,
-                  "transcript": transcript,
-                  "existing": existing},
-            timeout=90,
-        )
-        r.raise_for_status()
-        data = r.json()
-        return [str(p).strip() for p in data if str(p).strip()] if isinstance(data, list) else []
-    except Exception as exc:
-        logging.exception("Make")
-        st.error(exc)
-        return []
-
-# ══════════ Flipchart render ════════════════════════════════════════════
-STYLES = """
-<style>
-ul.flipchart {list-style:none;padding-left:0;}
-ul.flipchart>li{opacity:0;transform:translateY(8px);
-                animation:fadeIn .45s forwards;margin-bottom:1.2rem;}
-ul.flipchart strong{display:block;font-weight:700;margin-bottom:.4rem;}
-ul.flipchart ul{margin:0 0 0 1.2rem;padding-left:0;}
-ul.flipchart ul li{list-style:disc;margin-left:1rem;margin-bottom:.2rem;}
-@keyframes fadeIn{to{opacity:1;transform:translateY(0);}}
-.fullscreen header,.fullscreen #MainMenu,.fullscreen footer{visibility:hidden;}
-.fullscreen .block-container{padding-top:.5rem;}
-</style>
-"""
-DASH_SPLIT  = re.compile(r"\s+-\s+")
-STRIP_CHARS = "-–—• "
-
-def fmt(raw: str) -> str:
-    raw = raw.strip()
-    if "\n" in raw:
-        parts = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    else:
-        tmp = DASH_SPLIT.split(raw)
-        parts = [tmp[0]] + [f"- {p}" for p in tmp[1:]]
-
-    if not parts:
-        return ""
-    head, *det = parts
-    head_html = f"<strong>{head.upper()}</strong>"
-    if not det:
-        return head_html
-    items = "".join(f"<li>{d.lstrip(STRIP_CHARS)}</li>" for d in det)
-    return f"{head_html}<ul>{items}</ul>"
-
-def render_flip() -> None:
-    st.markdown(STYLES, unsafe_allow_html=True)
-    if not s.flip_points:
-        st.info("Čekám na shrnutí…")
-        return
-    html = "<ul class='flipchart'>" + "".join(
-        f"<li style='animation-delay:{i*0.1}s'>{fmt(p)}</li>"
-        for i, p in enumerate(s.flip_points)
-    ) + "</ul>"
-    st.markdown(html, unsafe_allow_html=True)
-
-# ══════════ AUDIO UTILS ═════════════════════════════════════════════════
-def pcm_to_wav(frames: list[bytes], sr: int = 48000) -> bytes:
+# ────────── Pomocné funkce ──────────────────────────────────────────────
+def pcm_to_wav(frames: list[bytes]) -> bytes:
     pcm = np.frombuffer(b"".join(frames), dtype=np.int16)
     with io.BytesIO() as buf:
         with wave.open(buf, "wb") as wf:
-            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(SAMPLE_RATE)
             wf.writeframes(pcm.tobytes())
-        buf.seek(0)
-        return buf.read()
+        buf.seek(0); return buf.read()
 
-# ══════════ STRUKTURA UI ════════════════════════════════════════════════
+def whisper_transcribe(wav: bytes) -> str | None:
+    try:
+        return client.audio.transcriptions.create(
+            model="whisper-1", file=io.BytesIO(wav), language="cs"
+        ).text
+    except OpenAIError as e:
+        st.error(f"Whisper: {e}"); return None
+
+def make_call(transcript: str) -> list[str]:
+    r = requests.post(MAKE_URL, json={
+        "token": WEBHOOK_TOKEN,
+        "transcript": transcript,
+        "existing": s.flip_points,
+    }, timeout=90)
+    try:
+        r.raise_for_status(); data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        st.error(f"Make error: {e}"); return []
+
+# ────────── Flipchart formátování ───────────────────────────────────────
+DASH = re.compile(r"\s+-\s+"); STRIP="-–—• "
+def format_point(raw: str) -> str:
+    parts = ([ln.strip() for ln in raw.splitlines() if ln.strip()]
+             if "\n" in raw else
+             [p if i==0 else f"- {p}" for i,p in enumerate(DASH.split(raw.strip()))])
+    if not parts: return ""
+    head,*det = parts
+    head_html = f"<strong>{head.upper()}</strong>"
+    if not det: return head_html
+    items = "".join(f"<li>{d.lstrip(STRIP)}</li>" for d in det)
+    return f"{head_html}<ul>{items}</ul>"
+
+def render_flip():
+    css = """<style>
+        ul.fl{list-style:none;padding-left:0;}
+        ul.fl>li{margin-bottom:1rem;}
+        ul.fl strong{display:block;margin-bottom:.25rem;}
+        </style>"""
+    st.markdown(css,unsafe_allow_html=True)
+    if not s.flip_points:
+        st.info("Čekám na první body…"); return
+    html = "<ul class='fl'>" + "".join(format_point(p) for p in s.flip_points) + "</ul>"
+    st.markdown(html,unsafe_allow_html=True)
+
+# ────────── UI rozložení ────────────────────────────────────────────────
 st.set_page_config(page_title="AI Moderator", layout="wide")
-tab_ctrl, tab_flip = st.tabs(["🛠 Ovládání", "📝 Flipchart"])
+col_ctrl, col_flip = st.columns([1,2])
 
-# === TAB Ovládání =======================================================
-with tab_ctrl:
-    st.header("Nahrávání / Upload")
-
-    # ── File upload ────────────────────────────────────────────────────
-    up = st.file_uploader("▶️ WAV/MP3/M4A", type=["wav", "mp3", "m4a"])
-    if up and not s.upload_processed:
-        with status_ctx("🟣 Whisper (upload)…"):
-            txt = whisper_safe(up, "upload")
-        if txt:
-            with status_ctx("📤 Make…", "🟢 Čekám Make"):
-                new = call_make(txt, s.flip_points)
-            s.flip_points.extend(p for p in new if p not in s.flip_points)
-            s.upload_processed = True
-
-    # ── Živý mikrofon ────────────────────────────────────────────────
-    st.subheader("🎤 Mikrofon (živý)")
+# === Sloupec 1: Ovládání + přepis =======================================
+with col_ctrl:
+    st.header("🎤 Mikrofon")
     webrtc_ctx = webrtc_streamer(
-        key="mic-main",
-        mode=WebRtcMode.SENDONLY,
-        audio_receiver_size=RECEIVER_SIZE,
+        key="mic", mode=WebRtcMode.SENDONLY, audio_receiver_size=RECEIVER_SIZE,
         rtc_configuration={"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]},
-        media_stream_constraints={"audio": True, "video": False},
+        media_stream_constraints={"audio":True,"video":False},
     )
+    transcript_box = st.empty()  # live přepis
 
-    # ukonči starý pipeline thread při rerunu
-    if (old := s.runner_thread) and old.is_alive():
-        s.audio_stop_event.set(); old.join(timeout=2)
+# === Sloupec 2: Flipchart ==============================================
+with col_flip:
+    st.header("📝 Flipchart")
+    flip_container = st.container()
+    render_flip()
 
-    stop_evt = threading.Event(); s.audio_stop_event = stop_evt
-    queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=8)
-
-    async def reader(ctx):
-        sr = 48000
-        target = AUDIO_BLOCK_SEC * sr * 2
-        buf: list[bytes] = []
-
-        while not stop_evt.is_set():
-            if not ctx.audio_receiver:
-                await asyncio.sleep(0.05); continue
-            try:
-                frames = ctx.audio_receiver.get_frames(timeout=1)  # není coroutine
-            except q.Empty:
-                continue
-
-            if frames:
-                s.last_frame_time = time.time()
-                set_status("🔴 Zachytávám audio…")
-
-            buf.extend(f.to_ndarray().tobytes() for f in frames)
-            if sum(map(len, buf)) >= target:
-                wav = pcm_to_wav(buf); buf.clear()
-                try:
-                    queue.put_nowait(wav)
-                except asyncio.QueueFull:
-                    _ = queue.get_nowait(); queue.put_nowait(wav)
-
-    async def worker():
-        while not stop_evt.is_set():
-            wav = await queue.get()
-            set_status("🟣 Whisper …")
-            txt = await asyncio.to_thread(
-                whisper_safe, io.BytesIO(wav), "mic"
-            )
-            if txt:
-                s.transcript_buffer += " " + txt
-                if len(s.transcript_buffer.split()) >= 325:
-                    set_status("📤 Make…")
-                    new_points = await asyncio.to_thread(
-                        call_make, s.transcript_buffer, s.flip_points
-                    )
-                    s.flip_points.extend(p for p in new_points if p not in s.flip_points)
-                    s.transcript_buffer = ""
-            queue.task_done()
+# ────────── Audio pipeline (v samostatném threadu) ──────────────────────
+if "runner_thread" not in s or not s.runner_thread or not s.runner_thread.is_alive():
+    stop_evt = threading.Event(); s.stop_evt = stop_evt
 
     async def pipeline():
-        await asyncio.gather(reader(webrtc_ctx), worker())
+        bytes_per_ms = SAMPLE_RATE * 2 // 1000
+        target_bytes = WHISPER_BLOCK_S * 1000 * bytes_per_ms
+        while not stop_evt.is_set():
+            if not webrtc_ctx.audio_receiver:
+                await asyncio.sleep(0.05); continue
+            try:
+                frames = webrtc_ctx.audio_receiver.get_frames(timeout=1)
+            except queue.Empty:
+                continue
+            s.audio_buf.extend(f.to_ndarray().tobytes() for f in frames)
 
-    thr = threading.Thread(
-        target=lambda: asyncio.run(pipeline()),
-        daemon=True,
-        name="audio-pipe",
-    )
+            if len(b"".join(s.audio_buf)) >= target_bytes:
+                wav = pcm_to_wav(s.audio_buf); s.audio_buf.clear()
+                txt = await asyncio.to_thread(whisper_transcribe, wav)
+                if txt:
+                    s.live_text += " " + txt
+                    transcript_box.text_area("Live transcript", s.live_text, height=200)
+
+            # každou MINUTU odešleme na Make
+            if time.time() - s.last_make >= MAKE_INTERVAL_S and s.live_text.strip():
+                bullets = await asyncio.to_thread(make_call, s.live_text)
+                s.flip_points.extend(p for p in bullets if p not in s.flip_points)
+                flip_container.empty(); render_flip()
+                s.live_text = ""; transcript_box.text_area("Live transcript", s.live_text, height=200)
+                s.last_make = time.time()
+
+    thr = threading.Thread(target=lambda: asyncio.run(pipeline()), daemon=True)
     add_script_run_ctx(thr); thr.start(); s.runner_thread = thr
-
-    # ── Mikrofonní tester (3 s) ────────────────────────────────────────
-    st.markdown("---")
-    with st.expander("🧪 Test mikrofonu – nahraj 3 s a přehraj"):
-        test_ctx = webrtc_streamer(
-            key="mic-test",
-            mode=WebRtcMode.SENDONLY,
-            audio_receiver_size=256,
-            rtc_configuration={"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]},
-            media_stream_constraints={"audio": True, "video": False},
-        )
-
-        if st.button("🎙️ Nahrát 3 s"):
-            if not test_ctx.audio_receiver:
-                st.warning("Mikrofon není připraven"); st.stop()
-
-            frames = []
-            start = time.time()
-            with st.spinner("Nahrávám…"):
-                while time.time() - start < 3:
-                    try:
-                        batch = test_ctx.audio_receiver.get_frames(timeout=1)
-                        frames.extend(f.to_ndarray().tobytes() for f in batch)
-                    except q.Empty:
-                        pass
-
-            test_ctx.stop()                     # korektní ukončení
-            s.test_wav = pcm_to_wav(frames)
-            st.success("Hotovo – přehrajte níže")
-
-        if s.test_wav:
-            st.audio(s.test_wav, format="audio/wav")
-
-    # ── Sidebar diagnostika ───────────────────────────────────────────
-    st.sidebar.header("ℹ️ Diagnostika")
-    st.sidebar.write("Body:", len(s.flip_points))
-    st.sidebar.write("Slov v bufferu:", len(s.transcript_buffer.split()))
-    if time.time() - s.last_frame_time < 2:
-        st.sidebar.success("🎙️ Zvuk přijímán")
-    else:
-        st.sidebar.warning("🟡 Žádný zvuk")
-    st.sidebar.write("Stav:", s.status)
-    st.sidebar.write("Audio thread:", thr.is_alive())
-
-# === TAB Flipchart ======================================================
-with tab_flip:
-    st.components.v1.html("<script>document.body.classList.add('fullscreen');</script>", height=0)
-    render_flip()
