@@ -1,135 +1,100 @@
 # ai_moderator.py
 """
-Mikrofon → Whisper → Make → Flipchart  (bez přetékání fronty)
-------------------------------------------------------------
-pip install streamlit streamlit-webrtc openai numpy requests
+Streamlit-webrtc ≥ 0.53  •  Mikrofon → Whisper → Make → Flipchart
 """
 
-import asyncio, io, queue, threading, time, wave, re
-from typing import Deque
-from collections import deque
+import asyncio, io, queue, threading, time, wave, re, logging
+import numpy as np, streamlit as st, requests
+from openai import OpenAI
+from streamlit_webrtc import webrtc_streamer, ClientSettings
 
-import numpy as np, requests, streamlit as st
-from openai import OpenAI, OpenAIError
-from streamlit.runtime.scriptrunner import add_script_run_ctx
-from streamlit_webrtc import webrtc_streamer, WebRtcMode
-
-# ───── Nastavení ────────────────────────────────────────────────────────
+# ─── Nastavení ──────────────────────────────────────────────────────────
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-MAKE_URL      = "https://hook.eu2.make.com/k08ew9w6ozdfougyjg917nzkypgq24f7"
-MAKE_TOKEN    = st.secrets.get("WEBHOOK_OUT_TOKEN", "out-token")
+MAKE_URL   = "https://hook.eu2.make.com/k08ew9w6ozdfougyjg917nzkypgq24f7"
+TOKEN      = st.secrets.get("WEBHOOK_OUT_TOKEN", "out-token")
 
-SR            = 48_000          # Hz
-BLOCK_SEC     = 5               # velikost WAV bloku pro Whisper
-MAKE_PERIOD   = 60              # s
-CAPACITY_PCM  = SR * 2 * BLOCK_SEC * 12   # ~1 min do dequ-pufru
+SR, BLOCK_SEC, PERIOD = 48_000, 5, 60
 
-# ───── Stav Streamlitu (minimal) ────────────────────────────────────────
+logging.getLogger("streamlit_webrtc").setLevel(logging.WARNING)
+
+# ─── Stav ───────────────────────────────────────────────────────────────
 s = st.session_state
-s.setdefault("flip",        [])
-s.setdefault("live_text",   "")
-s.setdefault("last_send",   time.time())
+for k, v in {"flip": [], "txt": "", "last_sent": time.time()}.items():
+    s.setdefault(k, v)
 
-# ───── Pomocné funkce ───────────────────────────────────────────────────
-def pcm_to_wav(pcm_bytes: bytes, sr: int = SR) -> bytes:
-    with io.BytesIO() as buf:
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
-            wf.writeframes(pcm_bytes)
-        buf.seek(0); return buf.read()
+# ─── Pomocné funkce ─────────────────────────────────────────────────────
+pcm_to_wav = lambda pcm: (lambda b: (wave.open((io := io.BytesIO()).write(b) or io, "wb")
+    .getparams() or io.seek(0) or io.read()))(
+        (lambda w: w.setnchannels(1) or w.setsampwidth(2)
+                  or w.setframerate(SR) or w.writeframes(pcm))(wave.open(io.BytesIO(), "wb")))  # compact hack
 
-def whisper(wav: bytes) -> str | None:
-    try:
-        return client.audio.transcriptions.create(model="whisper-1",
-                                                  file=io.BytesIO(wav),
-                                                  language="cs").text
-    except OpenAIError as e:
-        st.error(f"Whisper: {e}"); return None
+def whisper(wav: bytes) -> str:
+    return client.audio.transcriptions.create(
+        model="whisper-1", file=io.BytesIO(wav), language="cs"
+    ).text
 
-def make_call(text: str, existing: list[str]) -> list[str]:
-    try:
-        r = requests.post(MAKE_URL, json={
-            "token": MAKE_TOKEN,
-            "transcript": text,
-            "existing": existing,
-        }, timeout=90)
-        r.raise_for_status(); data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        st.error(f"Make: {e}"); return []
+def to_make(text: str, old: list[str]) -> list[str]:
+    r = requests.post(MAKE_URL, json={"token":TOKEN,"transcript":text,"existing":old}, timeout=90)
+    r.raise_for_status(); d = r.json(); return d if isinstance(d, list) else []
 
-# ───── Flipchart render ─────────────────────────────────────────────────
-DASH = re.compile(r"\s+-\s+"); STRIP="-–—• "
-def fmt(p: str) -> str:
-    parts = [ln.strip() for ln in p.splitlines() if ln.strip()] if "\n" in p \
-            else [x if i==0 else f"- {x}" for i,x in enumerate(DASH.split(p.strip()))]
-    head,*det = parts
-    head_html = f"<strong>{head.upper()}</strong>"
-    if not det: return head_html
-    items = "".join(f"<li>{d.lstrip(STRIP)}</li>" for d in det)
-    return f"{head_html}<ul>{items}</ul>"
+# ─── Flipchart render ───────────────────────────────────────────────────
+fmt = lambda p: "<strong>"+p.split("-")[0].upper()+"</strong>"+(
+    "" if "-" not in p else "<ul><li>"+ "</li><li>".join(p.split("-")[1:]) +"</li></ul>"
+)
+def show_flip(): st.markdown("<ul>"+ "".join(f"<li>{fmt(p)}</li>" for p in s.flip)+"</ul>",unsafe_allow_html=True)
 
-def render_flip(points):
-    css="<style>ul.f{list-style:none;padding-left:0;}ul.f>li{margin-bottom:1rem;}ul.f strong{display:block;margin-bottom:.3rem;}</style>"
-    st.markdown(css,unsafe_allow_html=True)
-    st.markdown("<ul class='f'>"+ "".join(fmt(p) for p in points)+"</ul>",unsafe_allow_html=True)
-
-# ───── UI ­layout ───────────────────────────────────────────────────────
+# ─── Layout ─────────────────────────────────────────────────────────────
 st.set_page_config("AI Moderator", layout="wide")
-col_left, col_right = st.columns([1,2])
+c1, c2 = st.columns([1,2])
 
-with col_left:
+with c2:
+    st.header("📝 Flipchart"); flip_box = st.empty(); show_flip()
+
+with c1:
     st.header("🎤 Mikrofon")
     live_box = st.empty()
-    # fronta pro příjem z callbacku
-    frame_q: queue.Queue[bytes] = queue.Queue(maxsize=500)
 
-    def audio_cb(f):
-        try:
-            frame_q.put_nowait(f.to_ndarray().tobytes())
-        except queue.Full:
-            pass                      # pokud nestíháme, starý dropneme
-        return f
-
-    webrtc_streamer( key="mic",
-        mode=WebRtcMode.SENDONLY,
-        in_audio_callback=audio_cb,          # ✓ okamžitě vybírá frame
+    # nový způsob – jen ClientSettings
+    settings = ClientSettings(
+        media_stream_constraints={"audio": True, "video": False},
         rtc_configuration={"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]},
-        media_stream_constraints={"audio":True,"video":False},
+        translation={"iceServers":[]},
+        audio_receiver_size=1024,
     )
 
-with col_right:
-    st.header("📝 Flipchart")
-    flip_box = st.empty()
-    render_flip(s.flip)
+    frame_q: "queue.Queue[bytes]" = queue.Queue(maxsize=512)
 
-# ───── Background pipeline (vybírá frontu, volá Whisper & Make) ─────────
+    def audio_cb(frame):
+        try: frame_q.put_nowait(frame.to_ndarray().tobytes())
+        except queue.Full: pass
+        return frame
+
+    webrtc_streamer(
+        key="mic",
+        client_settings=settings,
+        in_audio_frame_callback=audio_cb,   # nové jméno parametru
+    )
+
+# ─── Background vlákno — Whisper + Make ────────────────────────────────
 def backend():
-    pcm_buf: Deque[bytes] = deque(maxlen=CAPACITY_PCM//2)  # 16-bit = 2 B
-    bytes_per_block = BLOCK_SEC * SR * 2
-
+    buf = bytearray()
+    bytes_block = SR*2*BLOCK_SEC
     while True:
-        try:
-            pcm_buf.append(frame_q.get(timeout=1))
-        except queue.Empty:
-            pass
+        try: buf.extend(frame_q.get(timeout=1))
+        except queue.Empty: pass
+        if len(buf) >= bytes_block:
+            wav, buf[:] = pcm_to_wav(buf[:bytes_block]), buf[bytes_block:]
+            s.txt += " " + whisper(wav)
+            live_box.text_area("Live", s.txt, height=200)
 
-        if sum(map(len, pcm_buf)) >= bytes_per_block:
-            chunk = b"".join(pcm_buf); pcm_buf.clear()
-            wav = pcm_to_wav(chunk)
-            text = whisper(wav)
-            if text:
-                s.live_text += " " + text
-                live_box.text_area("Live transcript", s.live_text, height=220)
+        if time.time()-s.last_sent > PERIOD and s.txt.strip():
+            for p in to_make(s.txt, s.flip):
+                if p not in s.flip: s.flip.append(p)
+            s.txt, s.last_sent = "", time.time()
+            live_box.text_area("Live", s.txt, height=200)
+            flip_box.empty(); show_flip()
 
-        if time.time() - s.last_send >= MAKE_PERIOD and s.live_text.strip():
-            bullets = make_call(s.live_text, s.flip)
-            s.flip.extend(b for b in bullets if b not in s.flip)
-            flip_box.empty(); render_flip(s.flip)
-            s.live_text, s.last_send = "", time.time()
-            live_box.text_area("Live transcript", s.live_text, height=220)
-
-thr = threading.Thread(target=backend, daemon=True, name="backend")
-add_script_run_ctx(thr); thr.start()
+thr = threading.Thread(target=backend, daemon=True)
+if "thr" not in s: s.thr = thr; threading.Thread(target=backend, daemon=True).start()
