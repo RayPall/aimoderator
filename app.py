@@ -142,7 +142,7 @@ with tab1:
 
     st.subheader("🎤 Živý mikrofon")
     webrtc_ctx=webrtc_streamer(
-        key="workshop-audio", mode=WebRtcMode.SENDRECV, sendback_audio=False,
+        key="workshop-audio", mode=WebRtcMode.SENDRECV, sendback_audio=True,
         rtc_configuration={
             "iceTransportPolicy":"relay",
             "iceServers":[{
