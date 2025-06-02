@@ -184,7 +184,7 @@ with tabs[0]:
     webrtc_ctx = webrtc_streamer(
         key="workshop-audio",
         mode=WebRtcMode.SENDONLY,    # žádná ozvěna
-        audio_receiver_size=32,      # 🆕 větší fronta (bez overflow)
+        audio_receiver_size=64,      # 🆕 větší fronta (bez overflow)
         rtc_configuration={"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]},
         media_stream_constraints={"audio": True, "video": False},
     )
