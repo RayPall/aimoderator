@@ -7,7 +7,7 @@ import requests
 import streamlit as st
 from openai import OpenAI, OpenAIError
 from streamlit.runtime.scriptrunner import add_script_run_ctx
-from streamlit_webrtc import WebRtcMode, webrtc_streamer  # WebRtcState NEimportujeme
+from streamlit_webrtc import WebRtcMode, webrtc_streamer   # (bez WebRtcState)
 
 # ───────────── CONFIG ─────────────
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
@@ -15,7 +15,8 @@ if not OPENAI_API_KEY:
     st.error("Chybí OPENAI_API_KEY – přidejte jej do Secrets"); st.stop()
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-AUDIO_BATCH_SECONDS = 60                       # 1-minutová dávka audia
+
+AUDIO_BATCH_SECONDS = 60                      # 1-minutová dávka (~5,8 MB WAV)
 MAKE_WEBHOOK_URL   = "https://hook.eu2.make.com/k08ew9w6ozdfougyjg917nzkypgq24f7"
 WEBHOOK_OUT_TOKEN  = st.secrets.get("WEBHOOK_OUT_TOKEN", "out-token")
 
@@ -82,10 +83,7 @@ ul.flipchart strong {display:block; font-weight:700; margin-bottom:0.4rem;}
 ul.flipchart ul {margin:0 0 0 1.2rem; padding-left:0;}
 ul.flipchart ul li {list-style:disc; margin-left:1rem; margin-bottom:0.2rem;}
 @keyframes fadeIn {to {opacity:1; transform:translateY(0);}}
-/* fullscreen = schovej horní lištu + patičku, sidebar nech! */
-.fullscreen header,
-.fullscreen #MainMenu,
-.fullscreen footer {visibility:hidden;}
+.fullscreen header, .fullscreen #MainMenu, .fullscreen footer {visibility:hidden;}
 .fullscreen .block-container {padding-top:0.5rem;}
 </style>
 """
@@ -142,14 +140,13 @@ def run_async_forever(coro):
         loop.run_until_complete(
             asyncio.gather(*asyncio.all_tasks(loop), return_exceptions=True)
         )
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
+        loop.run_until_complete(loop.shutdown_asyncgens()); loop.close()
 
 # ───────────── UI ────────────────────
 st.set_page_config(page_title="AI Moderator", layout="wide")
 tab1, tab2 = st.tabs(["🛠 Ovládání", "📝 Flipchart"])
 
-# ::::: TAB 1 :::::::::::::::::::::::::
+# ::::: TAB 1 – Ovládání ::::::::::::::::::::::::::::::::::::::::::::::::::
 with tab1:
     st.header("Nastavení a vstup zvuku")
 
@@ -165,24 +162,33 @@ with tab1:
             )
             st.session_state.upload_processed = True
 
-    # ---- Mikrofon ----
+    # ---- Mikrofon (WebRTC) --------------------------------------------
     st.subheader("🎤 Živý mikrofon")
+
     webrtc_ctx = webrtc_streamer(
         key="workshop-audio",
         mode=WebRtcMode.SENDRECV,
         sendback_audio=False,
+
+        # OpenRelay Project – veřejný TURN
         rtc_configuration={
             "iceTransportPolicy": "relay",
-            "iceServers": [{
-                "urls": "turn:openrelay.metered.ca:443?transport=tcp",
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            }],
+            "iceServers": [
+                {
+                    "urls": [
+                        "turn:openrelay.metered.ca:80",
+                        "turn:openrelay.metered.ca:443?transport=tcp"
+                    ],
+                    "username": "openrelayproject",
+                    "credential": "openrelayproject",
+                }
+            ],
         },
+
         media_stream_constraints={"audio": True, "video": False},
     )
 
-    # WebRTC stav → status bar
+    # Stav WebRTC → status bar
     state_str = str(webrtc_ctx.state)
     if state_str.endswith("PLAYING"):
         set_status(f"🔴 Nahrávám … (plním {AUDIO_BATCH_SECONDS}s dávku)")
@@ -197,13 +203,15 @@ with tab1:
     stop_evt = threading.Event(); st.session_state.audio_stop_event = stop_evt
 
     async def audio_pipeline(ctx, stop_event):
-        SR = 48000
-        target_bytes = AUDIO_BATCH_SECONDS * SR * 2
+        SR = 48000; target_bytes = AUDIO_BATCH_SECONDS * SR * 2
         while not stop_event.is_set():
             if not ctx.audio_receiver:
                 await asyncio.sleep(0.1); continue
+
             frames = await ctx.audio_receiver.get_frames(timeout=1)
-            st.session_state.audio_buffer.extend(f.to_ndarray().tobytes() for f in frames)
+            st.session_state.audio_buffer.extend(
+                f.to_ndarray().tobytes() for f in frames
+            )
             if sum(len(b) for b in st.session_state.audio_buffer) < target_bytes:
                 await asyncio.sleep(0.05); continue
 
@@ -212,23 +220,32 @@ with tab1:
 
             with status_ctx("🟣 Whisper – zpracovávám…"):
                 tr = whisper_safe(io.BytesIO(wav), "mic")
-            if not tr: await asyncio.sleep(1); continue
+            if not tr:
+                await asyncio.sleep(1); continue
+
             st.session_state.transcript_buffer += " " + tr
 
             if len(st.session_state.transcript_buffer.split()) >= 325:
                 with status_ctx("📤 Odesílám do Make…", "🟢 Čekám Make"):
-                    new_pts = call_make(st.session_state.transcript_buffer,
-                                        st.session_state.flip_points)
+                    new_pts = call_make(
+                        st.session_state.transcript_buffer,
+                        st.session_state.flip_points,
+                    )
                 st.session_state.flip_points.extend(
-                    p for p in new_pts if p not in st.session_state.flip_points
+                    p for p in new_pts
+                    if p not in st.session_state.flip_points
                 )
                 st.session_state.transcript_buffer = ""
+
             set_status(f"🔴 Nahrávám … (plním {AUDIO_BATCH_SECONDS}s dávku)")
             await asyncio.sleep(0.05)
+
         set_status("⏹️ Audio pipeline ukončena")
 
     th = threading.Thread(
-        target=lambda c=webrtc_ctx,e=stop_evt: run_async_forever(audio_pipeline(c,e)),
+        target=lambda c=webrtc_ctx, e=stop_evt: run_async_forever(
+            audio_pipeline(c, e)
+        ),
         daemon=True,
     )
     add_script_run_ctx(th); th.start(); st.session_state.runner_thread = th
@@ -240,14 +257,15 @@ with tab1:
     st.sidebar.subheader("🧭 Stav"); st.sidebar.write(st.session_state.status)
     st.sidebar.write("Audio thread:", th.is_alive())
 
-# ::::: TAB 2 :::::::::::::::::::::::::
+# ::::: TAB 2 – Flipchart :::::::::::::::::::::::::::::::::::::::::::::::::
 with tab2:
-    # Přepínač fullscreen — sidebar zůstane
-    fullscreen = st.checkbox("🔲 Fullscreen zobrazení", key="flip_fullscreen")
-    js = f"""
-    <script>
-    document.body.classList.toggle('fullscreen', {str(fullscreen).lower()});
-    </script>
-    """
-    st.components.v1.html(js, height=0)
+    # Přepínač fullscreen
+    if st.checkbox("🔲 Fullscreen zobrazení", key="flip_fullscreen"):
+        st.components.v1.html(
+            "<script>document.body.classList.add('fullscreen');</script>", height=0
+        )
+    else:
+        st.components.v1.html(
+            "<script>document.body.classList.remove('fullscreen');</script>", height=0
+        )
     render_flipchart()
