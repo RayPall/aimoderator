@@ -186,7 +186,7 @@ def fmt_bullet(raw: str) -> str:
 
 # ─────────── UI – Streamlit layout ────────────────────────────────────────
 st.set_page_config("Audio → Whisper → Make Demo", layout="centered")
-st.title("🎙️ Audio Upload → Auto-compress → Chunking → Whisper → Make → Bullet-points")
+st.title("🎙️ Note-bot")
 
 uploaded = st.file_uploader(
     "➕ Nahraj MP3 / WAV / M4A (do ~200 MB)", 
