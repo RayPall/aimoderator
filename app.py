@@ -1,85 +1,114 @@
-# demo_audio_upload_whisper.py
+# audio_upload_whisper_sliced.py
 """
-Upload MP3/WAV → Whisper → Make (automaticky) → Bullet-pointy
-=============================================================
-1. Uživatel nahraje audio soubor (.mp3 / .wav / .m4a)
-2. Přepis proběhne přes OpenAI Whisper
-3. Přepis se **okamžitě** odešle na Make webhook
-4. Vrácené bullet-pointy se zobrazí na stránce
+Upload → Whisper (sliced if > 25 MiB) → Make → Bullet-points
+===========================================================
 
-→ Jednoduchá demonstrace integrace Streamlit + Whisper + Make
+• user uploads MP3/WAV/M4A  
+• if the file is ≤ 25 MiB → one Whisper call  
+• if it is larger  → file is sliced into 24 MiB chunks, each chunk is
+  sent to Whisper and transcripts are concatenated  
+• final transcript is POST-ed to a Make webhook; Make returns JSON array
+  of bullet-points, which we render as a simple flipchart
+
+requirements.txt
+----------------
+streamlit
+openai
+requests
 """
 
 from __future__ import annotations
 import io, re, logging, requests, streamlit as st
 from openai import OpenAI, OpenAIError
 
-# ─── API klíče & URL ────────────────────────────────────────────────────
+# ────────── CONFIG ──────────────────────────────────────────────────────
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]          # povinné
 MAKE_URL       = "https://hook.eu2.make.com/k08ew9w6ozdfougyjg917nzkypgq24f7"
 MAKE_TOKEN     = st.secrets.get("WEBHOOK_OUT_TOKEN", "demo-token")
 
+WHISPER_LIMIT  = 25 * 1024 * 1024          # 25 MiB
+CHUNK_SIZE     = 24 * 1024 * 1024          # safety margin
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 logging.basicConfig(level=logging.INFO)
 
-# ─── Funkce: Whisper & Make ─────────────────────────────────────────────
-def whisper_transcribe(file_obj: io.BufferedReader | io.BytesIO) -> str:
-    """Vrátí text (vyvolá Streamlit error při chybě)"""
-    try:
-        resp = client.audio.transcriptions.create(
-            model="whisper-1", file=file_obj, language="cs"
-        )
-        return resp.text
-    except OpenAIError as e:
-        st.error(f"❌ Whisper API: {e}")
-        raise
+# ────────── Whisper wrapper ─────────────────────────────────────────────
+def whisper_bytes(b: bytes, fname: str = "chunk") -> str:
+    """Send raw bytes to Whisper; return text or raise."""
+    file_like = io.BytesIO(b); file_like.name = fname
+    resp = client.audio.transcriptions.create(
+        model="whisper-1", file=file_like, language="cs"
+    )
+    return resp.text
 
-def send_to_make(transcript: str) -> list[str]:
+# ────────── Make webhook ────────────────────────────────────────────────
+def post_to_make(text: str) -> list[str]:
     try:
-        r = requests.post(
-            MAKE_URL,
-            json={"token": MAKE_TOKEN, "transcript": transcript, "existing": []},
-            timeout=90,
-        )
+        r = requests.post(MAKE_URL, json={
+            "token": MAKE_TOKEN,
+            "transcript": text,
+            "existing": [],
+        }, timeout=90)
         r.raise_for_status()
         data = r.json()
         return data if isinstance(data, list) else []
     except Exception as e:
-        st.error(f"❌ Make webhook: {e}")
+        st.error(f"Make error: {e}")
         return []
 
-# ─── Helper: formátování bullet-pointů ──────────────────────────────────
-DASH = re.compile(r"\s+-\s+"); STRIP="-–—• "
-def fmt(raw: str) -> str:
-    parts = ([ln.strip() for ln in raw.splitlines() if ln.strip()]
-             if "\n" in raw else
-             [p if i==0 else f"- {p}" for i,p in enumerate(DASH.split(raw.strip()))])
-    head,*det = parts
+# ────────── Flipchart formatting ────────────────────────────────────────
+DASH = re.compile(r"\s+-\s+"); STRIP = "-–—• "
+def fmt(pt: str) -> str:
+    parts = ([ln.strip() for ln in pt.splitlines() if ln.strip()]
+             if "\n" in pt else
+             [p if i==0 else f"- {p}" for i, p in enumerate(DASH.split(pt.strip()))])
+    head, *det = parts
     head_html = f"<strong>{head.upper()}</strong>"
     if not det: return head_html
     items = "".join(f"<li>{d.lstrip(STRIP)}</li>" for d in det)
     return f"{head_html}<ul>{items}</ul>"
 
-# ─── UI ─────────────────────────────────────────────────────────────────
-st.set_page_config("Audio → Whisper → Make")
-st.title("🎙️ Nahrát audio a získat bullet-pointy")
+# ────────── UI ──────────────────────────────────────────────────────────
+st.set_page_config("Audio → Whisper → Make demo")
+st.title("🎙️ Přepis audia a bullet-pointy z Make")
 
-uploaded = st.file_uploader("➡️ Přetáhni MP3/WAV/M4A", type=["mp3", "wav", "m4a"])
+uploaded = st.file_uploader("➕ Nahraj MP3 / WAV / M4A (max. 200 MB)", type=["mp3","wav","m4a"])
 
 if uploaded:
-    with st.spinner("⏳ Přepisuji přes Whisper…"):
-        transcript = whisper_transcribe(uploaded)
+    raw = uploaded.read()
+    st.write(f"Velikost souboru: **{len(raw)/1_048_576:.1f} MB**")
 
-    st.success("✅ Přepis hotov")
-    st.text_area("📄 Přepis", transcript, height=250)
+    # ── slicing podle velikosti ────────────────────────────────────────
+    chunks: list[bytes]
+    if len(raw) <= WHISPER_LIMIT:
+        chunks = [raw]
+    else:
+        st.info("Soubor > 25 MB → dělím na části")
+        chunks = [raw[i:i+CHUNK_SIZE] for i in range(0, len(raw), CHUNK_SIZE)]
 
+    # ── Whisper každého kusu ───────────────────────────────────────────
+    full_text = ""
+    for i, ch in enumerate(chunks, 1):
+        with st.spinner(f"Whisper {i}/{len(chunks)}…"):
+            try:
+                txt = whisper_bytes(ch, fname=f"part{i}.{uploaded.type}")
+                full_text += " " + txt
+            except OpenAIError as e:
+                st.error(f"Whisper chyba u části {i}: {e}")
+                st.stop()
+        st.success(f"Část {i} hotová")
+
+    st.subheader("📄 Kompletní přepis")
+    st.text_area(" ", full_text.strip(), height=250)
+
+    # ── Odešli na Make a zobraz bullet-pointy ───────────────────────────
     with st.spinner("📤 Odesílám přepis na Make…"):
-        bullets = send_to_make(transcript)
+        bullets = post_to_make(full_text)
 
     if bullets:
         st.markdown("---")
         st.subheader("📌 Body z Make")
-        st.markdown("<ul>"+ "".join(f"<li>{fmt(b)}</li>" for b in bullets)+"</ul>",
+        st.markdown("<ul>"+"".join(f"<li>{fmt(b)}</li>" for b in bullets)+"</ul>",
                     unsafe_allow_html=True)
     else:
         st.info("Make nevrátil žádné body.")
