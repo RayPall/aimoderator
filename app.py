@@ -162,7 +162,7 @@ def ffmpeg_segment_to_mp3s(input_path: str, out_dir: str) -> list[str]:
 
 # ─────────── UI – Streamlit layout ────────────────────────────────────────
 st.set_page_config("Audio → Whisper → Make Demo", layout="centered")
-st.title("🎙️ Audio Upload → Segmentace(30 s) → Whisper → Make → Bullet-points")
+st.title("🎙️ Note-bot")
 
 uploaded = st.file_uploader(
     "➕ Nahraj MP3 / WAV / M4A (až ~200 MB)", 
