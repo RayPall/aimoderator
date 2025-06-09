@@ -1,1 +1,11 @@
-ffmpeg
+pkg-config        # nutné, aby build PyAV našel FFmpeg
+ffmpeg            # binárka pro runtime i testy
+
+# hlavičky a knihovny FFmpeg pro kompilaci PyAV
+libavdevice-dev
+libavformat-dev
+libavfilter-dev
+libavcodec-dev
+libavutil-dev
+libswscale-dev
+libswresample-dev
