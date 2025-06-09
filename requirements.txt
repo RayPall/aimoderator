@@ -4,3 +4,4 @@ av==10.0.0           # PyAV – binární wheel už obsahuje FFmpeg
 ffmpeg-python==0.2.0 # jen tenké API, závislé na FFmpeg v PyAV
 openai==1.25.0
 requests>=2.31.0
+pkg-config
