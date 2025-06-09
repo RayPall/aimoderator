@@ -1,7 +1,5 @@
-pkg-config        # nutné, aby build PyAV našel FFmpeg
-ffmpeg            # binárka pro runtime i testy
-
-# hlavičky a knihovny FFmpeg pro kompilaci PyAV
+pkg-config
+ffmpeg        
 libavdevice-dev
 libavformat-dev
 libavfilter-dev
