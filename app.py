@@ -1,255 +1,164 @@
 # audio_upload_whisper_segmenter_live.py
-"""
-Streamlit aplikace: 
-1) **Upload režim** – uživatel nahraje audio soubor → segmentace FFmpeg → Whisper → Make → bullet‑points.
-2) **Live režim (WebRTC)** – aplikace zachytává mikrofon / virtuální loop‑back v prohlížeči (streamlit‑webrtc), 
-   každých 60 s odešle buffer do Whisper → Make → bullet‑points.
+"""Streamlit app that supports two modes:
+1. **Upload** – user uploads an audio file, script sends it to Whisper and then to Make to obtain bullet‑points.
+2. **Live (WebRTC)** – captures audio from the browser (mic or virtual loop‑back) via streamlit‑webrtc, buffers 60 s, sends to Whisper, displays bullet‑points in real‑time.
 
-Vyžaduje:
-    pip install streamlit streamlit-webrtc av openai ffmpeg-python requests
+Requirements (put in requirements.txt):
+    streamlit==1.35.0
+    streamlit-webrtc==0.46.0
+    av>=14.4.0               # wheel for Py ≥3.13, no compile step
+    ffmpeg-python~=0.2.0
+    openai==1.25.0
+    requests>=2.31.0
 
-Pro systémový zvuk použijte virtuální zařízení (VB‑Audio, BlackHole, Loopback…)
-a nastavte je jako vstupní mikrofon v prohlížeči.
+Optional packages.txt:
+    ffmpeg                   # runtime binary; dev headers nejsou nutné
+
+If `PYAV_LOGGING` env var is set to "off", PyAV disables its logging.
 """
 from __future__ import annotations
 
 import io
-import os
-import re
-import shutil
-import subprocess
-import tempfile
+import queue
 import threading
 import time
-import wave
 from pathlib import Path
-from typing import List
+from typing import Any, Deque, List
 
-import av  # streamlit-webrtc závislost
-import numpy as np
+import av  # PyAV ‑ required by streamlit‑webrtc
 import requests
 import streamlit as st
-from streamlit_webrtc import AudioProcessorBase, webrtc_streamer
+from streamlit_webrtc import (
+    AudioProcessorBase,
+    WebRtcMode,
+    webrtc_streamer,
+)
 
-import openai
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+SEGMENT_SEC = 60          # how long we buffer live audio before sending
+WHISPER_MODEL = "whisper-1"  # OpenAI Whisper model name
+MAKE_WEBHOOK_URL = st.secrets.get("MAKE_WEBHOOK_URL", "")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
 
-# ─────────── Nastavení API klíčů ────────────────────────────────────────────
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-MAKE_URL  = st.secrets.get("make_url", "")
-MAKE_TOKEN = st.secrets.get("make_token", "")
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
-openai.api_key = OPENAI_API_KEY
+def whisper_transcribe(audio_bytes: bytes, filename: str = "live.wav") -> str:
+    """Send raw WAV/MP3 bytes to OpenAI Whisper and return transcription text."""
+    import openai
 
-# ─────────── Helper: PCM → WAV (bytes) ─────────────────────────────────────
-def pcm_to_wav(pcm_bytes: bytes, sr: int = 16_000) -> bytes:
-    """Zabalí raw 16‑bit mono PCM do WAV kontejneru (in‑memory)."""
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    files = {"file": (filename, io.BytesIO(audio_bytes), "audio/wav")}
+    response = client.audio.transcriptions.create(model=WHISPER_MODEL, file=files["file"])
+    return response.text  # type: ignore[attr-defined]
+
+
+def post_to_make(transcript: str) -> List[str]:
+    """Send transcript to Make scenario via webhook; receive bullet‑points list."""
+    if not MAKE_WEBHOOK_URL:
+        return ["(Make webhook URL not configured)"]
+    resp = requests.post(MAKE_WEBHOOK_URL, json={"transcript": transcript}, timeout=30)
+    resp.raise_for_status()
+    return resp.json().get("bullets", [])
+
+
+# ---------------------------------------------------------------------------
+# Live audio processor
+# ---------------------------------------------------------------------------
+class LiveAudioProcessor(AudioProcessorBase):
+    def __init__(self):
+        self._buffer: bytearray = bytearray()
+        self._last_sent = time.time()
+        self.sample_rate = 48000  # streamlit‑webrtc default for browser mic
+
+    def recv_audio(self, frame: av.AudioFrame) -> av.AudioFrame:  # type: ignore[override]
+        pcm = frame.to_ndarray().tobytes()
+        self._buffer.extend(pcm)
+        now = time.time()
+        if now - self._last_sent >= SEGMENT_SEC:
+            # Convert raw PCM to WAV in‑memory
+            wav_bytes = _pcm_to_wav(bytes(self._buffer), self.sample_rate)
+            threading.Thread(target=_process_and_update, args=(wav_bytes,), daemon=True).start()
+            self._buffer.clear()
+            self._last_sent = now
+        return frame  # pass‑through so user hears themself if needed
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _pcm_to_wav(pcm: bytes, sample_rate: int) -> bytes:
+    import wave
+
     buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)          # 16‑bit
-        wf.setframerate(sr)
-        wf.writeframes(pcm_bytes)
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)  # 16‑bit
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm)
     return buf.getvalue()
 
 
-# ─────────── Whisper transkripce ───────────────────────────────────────────
-def whisper_transcribe(audio_bytes: bytes, fname: str = "audio.wav") -> str:
-    """Pošle audio bytes do Whisper‑1 (OpenAI) a vrátí text."""
-    try:
-        audio_file = io.BytesIO(audio_bytes)
-        audio_file.name = fname
-        resp = openai.audio.translations.create(
-            model="whisper-1",
-            file=audio_file,
-            response_format="text",
-        )
-        return resp  # type: ignore – OpenAI vrací str
-    except Exception as e:
-        st.error(f"❌ Whisper chyba: {e}")
-        return ""
+def _process_and_update(wav_bytes: bytes) -> None:
+    """Background thread: send to Whisper + Make, then update UI."""
+    txt = whisper_transcribe(wav_bytes)
+    bullets = post_to_make(txt)
+    # Append to session state list; trigger rerun
+    st.session_state.setdefault("bullets", []).extend(bullets)
+    st.session_state.setdefault("transcripts", []).append(txt)
+    st.experimental_rerun()
 
 
-# ─────────── Make webhook → bullet‑points ──────────────────────────────────
-def post_to_make(text: str) -> List[str]:
-    """Odešle transkript do Make webhooku a očekává list bullet‑pointů."""
-    if not text.strip():
-        return []
-    try:
-        r = requests.post(
-            MAKE_URL,
-            json={"token": MAKE_TOKEN, "transcript": text, "existing": []},
-            timeout=90,
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        st.error(f"❌ Make webhook chyba: {e}")
-        return []
+# ---------------------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------------------
 
+def main() -> None:
+    st.title("📝 AI Moderátor – audio→bullet‑points")
 
-# ─────────── Formátování bullet‑pointů ─────────────────────────────────────
-DASH = re.compile(r"\s+-\s+")
+    mode = st.sidebar.radio("Režim", ["Upload", "Live (WebRTC)"])
+    interval = st.sidebar.slider("Interval odesílání (s)", 15, 120, SEGMENT_SEC, 5)
+    global SEGMENT_SEC
+    SEGMENT_SEC = interval
 
-def fmt_bullet(raw: str) -> str:
-    """Nadpis (první řádek) tučně (uppercase), pod‑body jako <li>…</li>."""
-    if "\n" in raw:
-        parts = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if mode == "Upload":
+        _upload_ui()
     else:
-        items = DASH.split(raw.strip())
-        parts = [items[0]] + [f"- {p}" for p in items[1:]]
-    if not parts:
-        return ""
-    head, *det = parts
-    head_html = f"<strong>{head.upper()}</strong>"
-    if not det:
-        return head_html
-    det_html = "".join(f"<li>{d}</li>" for d in det)
-    return f"{head_html}<ul>{det_html}</ul>"
+        _live_ui()
 
 
-# ─────────── Streamlit UI -----------------------------------------------------------------
-st.set_page_config(page_title="AI moderátor – live bullet‑points", page_icon="🎙️")
-
-st.title("🎙️ AI moderátor – přepis a bullet‑pointy v reálném čase")
-
-MODE = st.sidebar.radio(
-    "Režim",
-    ("Live (WebRTC)", "Soubor upload"),
-    index=0,
-    help="Live režim zachytává mikrofon/systémový zvuk přes WebRTC. "
-    "Upload režim umožní nahrát existující audio soubor.",
-)
-
-# Container pro dynamické bullet‑pointy
-bullet_placeholder = st.empty()
-if "bullets" not in st.session_state:
-    st.session_state["bullets"] = []
-
-def render_bullets():
-    bullets = st.session_state.get("bullets", [])
-    if bullets:
-        bullet_placeholder.markdown(
-            "<hr><h3>📌 Bullet‑pointy</h3><ul>"
-            + "".join(f"<li>{fmt_bullet(b)}</li>" for b in bullets)
-            + "</ul>",
-            unsafe_allow_html=True,
-        )
-
-render_bullets()
-
-# ─────────── Live režim (WebRTC) ───────────────────────────────────────────
-if MODE == "Live (WebRTC)":
-    st.info(
-        "🔴 **Live**: Aplikace nahrává zvuk z vašeho mikrofonu "
-        "(nebo virtuálního loop‑backu) a každou minutu ho odesílá do Whisperu."
-    )
-
-    SEGMENT_SEC = st.sidebar.slider("Interval odesílání (s)", 30, 120, 60, 5)
-    SAMPLE_RATE = 16_000
-
-    class LiveAudioProcessor(AudioProcessorBase):
-        def __init__(self):
-            self.buffer = bytearray()
-            self.last_sent = time.time()
-            self.lock = threading.Lock()
-            self.counter = 0
-
-        def recv_audio(self, frame):
-            pcm = frame.to_ndarray()  # int16 numpy array
-            with self.lock:
-                self.buffer.extend(pcm.tobytes())
-                elapsed = time.time() - self.last_sent
-                if elapsed >= SEGMENT_SEC:
-                    pcm_bytes = bytes(self.buffer)
-                    # Vyprázdnit buffer a posunout timestamp
-                    self.buffer.clear()
-                    self.last_sent = time.time()
-                    # Asynchronně zpracovat segment
-                    threading.Thread(
-                        target=self._process_segment,
-                        args=(pcm_bytes, self.counter),
-                        daemon=True,
-                    ).start()
-                    self.counter += 1
-            return frame  # passthrough
-
-        def _process_segment(self, pcm_bytes: bytes, idx: int):
-            wav_bytes = pcm_to_wav(pcm_bytes, sr=SAMPLE_RATE)
-            transcript = whisper_transcribe(wav_bytes, fname=f"live_{idx:03d}.wav")
+def _upload_ui() -> None:
+    uploaded = st.file_uploader("Nahraj audio soubor", type=["wav", "mp3", "m4a"])
+    if uploaded and st.button("Přepsat a vytvořit bullet‑points"):
+        with st.spinner("Odesílám do Whisperu…"):
+            transcript = whisper_transcribe(uploaded.read(), uploaded.name)
             bullets = post_to_make(transcript)
-            if bullets:
-                st.session_state.setdefault("bullets", []).extend(bullets)
-                # UI refresh
-                render_bullets()
-                st.toast(f"📝 Přidáno {len(bullets)} bullet‑pointů", icon="✅")
+        st.subheader("Bullet‑points")
+        st.markdown("\n".join(f"• {b}" for b in bullets))
 
-    webrtc_streamer(
+
+def _live_ui() -> None:
+    st.markdown("Klikni **Allow** pro mikrofon / virtual loop‑back.")
+    webrtc_ctx = webrtc_streamer(
         key="live_audio",
-        mode="SENDRECV",
+        mode=WebRtcMode.SENDRECV,  # enum, not string!
         audio_processor_factory=LiveAudioProcessor,
         media_stream_constraints={"audio": True, "video": False},
         async_processing=True,
     )
 
-# ─────────── Soubor upload režim (původní workflow) ────────────────────────
-else:
-    uploaded = st.file_uploader(
-        "Nahrajte audio soubor (MP3/WAV/M4A)…",
-        type=["mp3", "wav", "m4a"],
-        accept_multiple_files=False,
-    )
+    st.subheader("Živé bullet‑points")
+    bullets_area = st.empty()
+    bullets = st.session_state.get("bullets", [])
+    if bullets:
+        bullets_area.markdown("\n".join(f"• {b}" for b in bullets))
+    else:
+        bullets_area.info("Čekám na první minutový segment…")
 
-    if uploaded:
-        import ffmpeg  # dynamický import – jen když je potřeba
 
-        # 1) Uložit upload do temp
-        raw_bytes = uploaded.read()
-        size_mb = len(raw_bytes) / (1024 * 1024)
-        st.write(f"Velikost nahrávky: **{size_mb:.1f}\u00a0MB**")
-
-        tmp_input = tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix)
-        tmp_input.write(raw_bytes)
-        tmp_input.flush()
-        tmp_input_path = tmp_input.name
-        tmp_input.close()
-
-        # 2) Dočasný adresář pro 30 s segmenty
-        tmp_dir = tempfile.mkdtemp(prefix="audio_chunks_")
-
-        # 3) Spustit FFmpeg segmentaci
-        with st.spinner("🔀 Segmentuji pomocí FFmpeg…"):
-            (
-                ffmpeg
-                .input(tmp_input_path)
-                .output(
-                    str(Path(tmp_dir) / "chunk%03d.mp3"),
-                    ar=16_000, ac=1, audio_bitrate="32k",
-                    f="segment", segment_time=30, reset_timestamps=1,
-                    loglevel="error"
-                )
-                .overwrite_output()
-                .run()
-            )
-
-        # 4) Seřadit segmenty a poslat do Whisper
-        chunks = sorted(Path(tmp_dir).glob("chunk*.mp3"))
-        transcripts: List[str] = []
-        prog = st.progress(0, "🎙️ Transkribuji…")
-        for i, ch in enumerate(chunks, start=1):
-            with ch.open("rb") as f:
-                transcripts.append(whisper_transcribe(f.read(), ch.name))
-            prog.progress(i / len(chunks))
-        full_transcript = "\n".join(transcripts)
-
-        # 5) Odeslat do Make
-        st.success("✅ Transkripce hotová – odesílám do Make…")
-        bullets = post_to_make(full_transcript)
-
-        # 6) Zobrazit bullet‑points
-        st.session_state.setdefault("bullets", []).extend(bullets)
-        render_bullets()
-
-        # 7) Úklid
-        os.unlink(tmp_input_path)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+if __name__ == "__main__":
+    main()
