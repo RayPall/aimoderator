@@ -2,3 +2,5 @@ streamlit
 openai
 requests
 pydub
+av
+numpy
