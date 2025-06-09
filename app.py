@@ -31,8 +31,8 @@ from streamlit_webrtc import AudioProcessorBase, WebRtcMode, webrtc_streamer
 # ---------------------------------------------------------------------------
 SEGMENT_SEC = 60                 # výchozí délka minutového segmentu
 WHISPER_MODEL = "whisper-1"      # OpenAI Whisper model name
-MAKE_WEBHOOK_URL = st.secrets.get("MAKE_WEBHOOK_URL", "")
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+MAKE_WEBHOOK_URL = st.secrets.get("MAKE_WEBHOOK_URL", "https://hook.eu2.make.com/k08ew9w6ozdfougyjg917nzkypgq24f7")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
 
 # ---------------------------------------------------------------------------
 # Whisper + Make helpers
