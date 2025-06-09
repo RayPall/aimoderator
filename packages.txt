@@ -1,8 +1,1 @@
-ffmpeg        
-libavdevice-dev
-libavformat-dev
-libavfilter-dev
-libavcodec-dev
-libavutil-dev
-libswscale-dev
-libswresample-dev
+ffmpeg
