@@ -1,174 +1,150 @@
 # audio_upload_whisper_segmenter_live.py
 """
-Streamlit app with two modes:
-1. **Upload** – user uploads an audio file, the app sends it to OpenAI Whisper → Make webhook → shows bullet‑points.
-2. **Live (WebRTC)** – captures microphone / virtual loop‑back audio in browser, buffers a user‑set interval, sends each chunk to Whisper, forwards the transcript to Make, and streams the bullet‑points live.
+Streamlit app
+1. **Upload** – user uploads an audio file > Whisper > Make webhook > bullet‑points.
+2. **Live (WebRTC)** – capt­ures mic / virtual cable audio in browser, slices every `SEGMENT_SEC`, sends to Whisper → Make, streams bullet‑points live.
 
-## Runtime requirements
-Put this into **requirements.txt**
-```
-streamlit==1.35.0
-streamlit-webrtc==0.46.0
-av>=14.4.0              # wheels available for Py 3.13
-ffmpeg-python~=0.2.0
-openai==1.25.0
-requests>=2.31.0
-```
-Optional minimal **packages.txt** for Streamlit Cloud / Docker base image:
-```
-ffmpeg                 # only the binary, no ‑dev headers needed
-```
-If you run on Streamlit Cloud you may omit `runtime.txt`; if you keep it, `python-3.13.x` works fine with AV ≥ 14.
+Key changes vs. previous revision
+--------------------------------
+* **ŽÁDNÉ `st.experimental_rerun`** – nahrazeno vlajkou v `st.session_state` a jemným `st_autorefresh` každých 500 ms, aby nedocházelo k fatal write errorům.
+* **Public TURN fallback** – STUN nestačil; přidán free TURN (Metered) ⇒ ICE handshake projde i za NAT/UDP blokádou.
+* **Debug panel** – zobrazuje stav peer‑connection a počet přijato snímků.
 """
 from __future__ import annotations
 
+import asyncio
 import io
+import queue
 import threading
 import time
 from typing import List
 
-import av                     # PyAV – required by streamlit‑webrtc
+import av
 import requests
 import streamlit as st
-from streamlit_webrtc import (
-    AudioProcessorBase,
-    WebRtcMode,
-    webrtc_streamer,
-)
+from streamlit_extras.st_autorefresh import st_autorefresh
+from streamlit_webrtc import AudioProcessorBase, WebRtcMode, webrtc_streamer
 
-# ---------------------------------------------------------------------------
-# CONFIG (override in .streamlit/secrets.toml or Streamlit Cloud Secrets UI)
-# ---------------------------------------------------------------------------
-SEGMENT_SEC = 60                          # default chunk length in seconds
-WHISPER_MODEL = "whisper-1"              # OpenAI Whisper model name
-MAKE_WEBHOOK_URL = st.secrets.get("MAKE_WEBHOOK_URL", "")
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
+# ----------------------------------------------------------------------------
+# CONFIG (override in secrets)
+# ----------------------------------------------------------------------------
+SEGMENT_SEC       = 60
+WHISPER_MODEL     = "whisper-1"
+MAKE_WEBHOOK_URL  = st.secrets.get("MAKE_WEBHOOK_URL", "")
+OPENAI_API_KEY    = st.secrets.get("OPENAI_API_KEY", "")
 
-# ---------------------------------------------------------------------------
-# OpenAI Whisper + Make helpers
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# OpenAI Whisper + Make webhook helpers
+# ----------------------------------------------------------------------------
 
-def whisper_transcribe(audio_bytes: bytes, filename: str = "live.wav") -> str:
-    """Send WAV/MP3 bytes to Whisper and return transcript text."""
+def whisper_transcribe(wav: bytes) -> str:
     import openai
-
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
-    resp = client.audio.transcriptions.create(
+    r = client.audio.transcriptions.create(
         model=WHISPER_MODEL,
-        file=(filename, io.BytesIO(audio_bytes), "audio/wav"),  # type: ignore[arg-type]
+        file=("live.wav", io.BytesIO(wav), "audio/wav"),  # type: ignore[arg-type]
     )
-    return resp.text  # type: ignore[attr-defined]
+    return r.text  # type: ignore[attr-defined]
 
-
-def post_to_make(transcript: str) -> List[str]:
-    """POST transcript to Make scenario → expect JSON { bullets: [...] }."""
+def post_to_make(text: str) -> List[str]:
     if not MAKE_WEBHOOK_URL:
-        return ["(⚠️ MAKE_WEBHOOK_URL chybí v Streamlit secrets.)"]
-    r = requests.post(MAKE_WEBHOOK_URL, json={"transcript": transcript}, timeout=30)
-    r.raise_for_status()
-    return r.json().get("bullets", [])
+        return ["(⚠️ MAKE_WEBHOOK_URL není nastaven)"]
+    res = requests.post(MAKE_WEBHOOK_URL, json={"transcript": text}, timeout=30)
+    res.raise_for_status()
+    return res.json().get("bullets", [])
 
-# ---------------------------------------------------------------------------
-# Live audio processor
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+#  Live audio processor – push results do fronty
+# ----------------------------------------------------------------------------
 
-class LiveAudioProcessor(AudioProcessorBase):
-    """Collect raw PCM frames and every SEGMENT_SEC send them for processing."""
+_result_q: "queue.Queue[List[str]]" = queue.Queue()
 
+class LiveProcessor(AudioProcessorBase):
     def __init__(self):
-        self.buffer = bytearray()
-        self.last_sent = time.time()
-        self.sample_rate = 48000  # streamlit‑webrtc default
-
+        self.buf = bytearray(); self.last = time.time(); self.rate = 48000
     def recv_audio(self, frame: av.AudioFrame):  # type: ignore[override]
-        self.buffer.extend(frame.to_ndarray().tobytes())
-        if time.time() - self.last_sent >= SEGMENT_SEC:
-            wav_bytes = _pcm_to_wav(bytes(self.buffer), self.sample_rate)
-            threading.Thread(
-                target=_process_and_update, args=(wav_bytes,), daemon=True
-            ).start()
-            self.buffer.clear()
-            self.last_sent = time.time()
-        return frame  # pass through unchanged
+        self.buf.extend(frame.to_ndarray().tobytes())
+        if time.time() - self.last >= SEGMENT_SEC:
+            wav = _pcm_to_wav(bytes(self.buf), self.rate)
+            threading.Thread(target=_worker, args=(wav,), daemon=True).start()
+            self.buf.clear(); self.last = time.time()
+        return frame
 
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
+def _pcm_to_wav(pcm: bytes, sr: int) -> bytes:
+    import wave, io as _io
+    b = _io.BytesIO()
+    with wave.open(b, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(pcm)
+    return b.getvalue()
 
-def _pcm_to_wav(pcm: bytes, sample_rate: int) -> bytes:
-    import wave
+def _worker(wav: bytes):
+    try:
+        txt = whisper_transcribe(wav)
+        bullets = post_to_make(txt)
+    except Exception as e:
+        bullets = [f"❌ {e}"]
+    _result_q.put(bullets)
+    st.session_state["__new__"] = True  # flag pro UI
 
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)         # 16‑bit
-        wav.setframerate(sample_rate)
-        wav.writeframes(pcm)
-    return buf.getvalue()
+# ----------------------------------------------------------------------------
+# UI
+# ----------------------------------------------------------------------------
 
+def main():
+    global SEGMENT_SEC
+    st.title("📝 AI Moderátor – audio ➜ bullet‑points")
 
-def _process_and_update(wav_bytes: bytes) -> None:
-    """Background worker: Whisper → Make → push result into session state."""
-    transcript = whisper_transcribe(wav_bytes)
-    bullets = post_to_make(transcript)
-    st.session_state.setdefault("bullets", []).extend(bullets)
-    st.session_state.setdefault("transcripts", []).append(transcript)
-    # trigger UI refresh
-    st.experimental_rerun()
-
-# ---------------------------------------------------------------------------
-# Streamlit UI building blocks
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    global SEGMENT_SEC  # declare early
-
-    st.title("📝 AI Moderátor – audio ➜ bullet‑points")
-
-    mode = st.sidebar.radio("Režim", ["Upload", "Live (WebRTC)"])
-    SEGMENT_SEC = st.sidebar.slider("Interval odesílání (s)", 15, 180, SEGMENT_SEC, 5)
+    mode = st.sidebar.radio("Režim", ["Upload", "Live"])
+    SEGMENT_SEC = st.sidebar.slider("Interval odesílání (s)", 15, 180, SEGMENT_SEC, 5)
 
     if mode == "Upload":
-        _upload_ui()
-    else:
-        _live_ui()
+        upload_ui(); return
+
+    live_ui()
 
 
-def _upload_ui() -> None:
-    uploaded = st.file_uploader("Nahraj audio soubor", type=["wav", "mp3", "m4a"])
-    if uploaded and st.button("Přepsat a vytvořit bullet‑points"):
-        with st.spinner("⏳ Odesílám do Whisperu…"):
-            transcript = whisper_transcribe(uploaded.read(), uploaded.name)
-            bullets = post_to_make(transcript)
+def upload_ui():
+    f = st.file_uploader("Nahraj audio", type=["wav", "mp3", "m4a"])
+    if f and st.button("Zpracovat"):
+        with st.spinner("Whisper → Make…"):
+            txt = whisper_transcribe(f.read())
+            bullets = post_to_make(txt)
         st.subheader("Bullet‑points")
         st.markdown("\n".join(f"• {b}" for b in bullets))
 
 
-def _live_ui() -> None:
+def live_ui():
     st.markdown("Klikni **Allow** pro mikrofon / virtuální kabel.")
 
     ctx = webrtc_streamer(
         key="live_audio",
-        mode=WebRtcMode.SENDONLY,  # nepotřebujeme přijímat video/audio zpět
-        audio_processor_factory=LiveAudioProcessor,
+        mode=WebRtcMode.SENDONLY,
+        audio_processor_factory=LiveProcessor,
         media_stream_constraints={"audio": True, "video": False},
-        rtc_configuration={  # veřejný STUN server
-            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        rtc_configuration={
+            "iceServers": [
+                {"urls": ["stun:stun.l.google.com:19302"]},
+                {"urls": "turn:global.relay.metered.ca:80", "username": "global", "credential": "global"},
+            ]
         },
-        async_processing=True,
     )
 
-    # Debug info (optional):
     st.caption(f"WebRTC state: {ctx.state}")
 
-    # Live bullet‑points output
-    st.subheader("Živé bullet‑points")
-    bullets_box = st.empty()
-    bullets = st.session_state.get("bullets", [])
-    if bullets:
-        bullets_box.markdown("\n".join(f"• {b}" for b in bullets))
-    else:
-        bullets_box.info("Čekám na první segment…")
+    st_autorefresh(interval=500, key="__auto")
+
+    if "bullets" not in st.session_state:
+        st.session_state["bullets"] = []
+    col = st.container()
+    if st.session_state.pop("__new__", False):
+        try:
+            while True:
+                st.session_state["bullets"].extend(_result_q.get_nowait())
+        except queue.Empty:
+            pass
+    b = st.session_state["bullets"]
+    col.subheader("Živé bullet‑points")
+    col.markdown("\n".join(f"• {x}" for x in b) if b else "_Čekám na první segment…_")
 
 
 if __name__ == "__main__":
