@@ -4,4 +4,4 @@ av>=14.4.0
 ffmpeg-python~=0.2.0
 openai>=1.25.0
 requests>=2.31.0
-streamlit-extras>=0.4.0
+streamlit-extras
