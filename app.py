@@ -2,130 +2,150 @@
 """
 Streamlit app
 1. **Upload** – user uploads an audio file → Whisper → Make webhook → bullet‑points.
-2. **Live (WebRTC)** – zachytí mikrofon/virtuální kabel v prohlížeči, každých `SEGMENT_SEC` pošle chunk do Whisper a bullet‑points se zobrazují průběžně.
+2. **Live (WebRTC)** – captures mic / virtual cable audio in browser, slices every `SEGMENT_SEC`, sends to Whisper → Make, streams bullet‑points live.
 
-▶︎ `st_autorefresh` byl nahrazen **bezpečným fallbackem** – když balíček
-`streamlit‑extras` není přítomný, definujeme no‑op funkci. Appka se díky tomu
-spustí i bez extra závislosti; periodické refreshe jsou příjemné, ale ne
-nezbytné.
+New in this version
+-------------------
+* **Live audio level indicator** – realtime RMS bar that turns green when sound is detected.
+* Hard dependency on `streamlit-extras` removed; if absent, the app still runs.
 """
 from __future__ import annotations
 
-import io, queue, threading, time
+import asyncio, io, time, threading, queue
 from typing import List
 
 import av
+import numpy as np
+import openai
 import requests
 import streamlit as st
-from streamlit_webrtc import AudioProcessorBase, WebRtcMode, webrtc_streamer
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
 
-# ---------------------------------------------------------------
-# optional autorefresh – nespadne, pokud chybí streamlit‑extras
-# ---------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# OPTIONAL refresh helper -------------------------------------------------------
+# ------------------------------------------------------------------------------
 try:
     from streamlit_extras.st_autorefresh import st_autorefresh  # type: ignore
-except ModuleNotFoundError:  # fallback → no‑op
-    def st_autorefresh(*_, **__):  # pytype: disable=invalid-function-definition
+except ModuleNotFoundError:  # fallback – noop stub
+    def st_autorefresh(*_, **__):
         return None
 
-# ---------------------------------------------------------------
-# CONFIG (lze přepsat v Secrets)
-# ---------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# CONFIG (fill these two in Secrets) -------------------------------------------
+# ------------------------------------------------------------------------------
 SEGMENT_SEC       = 60
 WHISPER_MODEL     = "whisper-1"
 MAKE_WEBHOOK_URL  = st.secrets.get("MAKE_WEBHOOK_URL", "")
 OPENAI_API_KEY    = st.secrets.get("OPENAI_API_KEY", "")
 
-# ---------------------------------------------------------------
-# OpenAI Whisper + Make webhook
-# ---------------------------------------------------------------
+client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-def whisper_transcribe(wav: bytes) -> str:
-    import openai
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-    r = client.audio.transcriptions.create(
+# global queues communicated between threads and main UI
+result_q: "queue.Queue[List[str]]" = queue.Queue()
+level_q:  "queue.Queue[float]"    = queue.Queue(maxsize=5)
+
+# ------------------------------------------------------------------------------
+# Helper functions --------------------------------------------------------------
+# ------------------------------------------------------------------------------
+
+def whisper_transcribe(wav_bytes: bytes) -> str:
+    resp = client.audio.transcriptions.create(
         model=WHISPER_MODEL,
-        file=("live.wav", io.BytesIO(wav), "audio/wav"),  # type: ignore[arg-type]
+        file=("live.wav", io.BytesIO(wav_bytes), "audio/wav")  # type: ignore[arg-type]
     )
-    return r.text  # type: ignore[attr-defined]
+    return resp.text  # type: ignore[attr-defined]
 
-
-def post_to_make(text: str) -> List[str]:
+def post_to_make(transcript: str) -> List[str]:
     if not MAKE_WEBHOOK_URL:
-        return ["(⚠️ MAKE_WEBHOOK_URL není nastaven)"]
-    res = requests.post(MAKE_WEBHOOK_URL, json={"transcript": text}, timeout=30)
-    res.raise_for_status()
-    return res.json().get("bullets", [])
+        return ["(⚠️ MAKE_WEBHOOK_URL není v Secrets)"]
+    r = requests.post(MAKE_WEBHOOK_URL, json={"transcript": transcript}, timeout=30)
+    r.raise_for_status()
+    return r.json().get("bullets", [])
 
-# ---------------------------------------------------------------
-# Audio processing → fronta výsledků
-# ---------------------------------------------------------------
+def pcm_to_wav(pcm: bytes, sr: int) -> bytes:
+    import wave, io as _io
+    buf = _io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(pcm)
+    return buf.getvalue()
 
-_result_q: "queue.Queue[List[str]]" = queue.Queue()
+# ------------------------------------------------------------------------------
+# Audio processor ---------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
-class LiveProcessor(AudioProcessorBase):
+class LiveAudioProcessor(AudioProcessorBase):
     def __init__(self):
-        self.buf = bytearray(); self.last = time.time(); self.rate = 48000
+        self._buf: bytearray = bytearray()
+        self._last = time.time()
+        self._rate = 48000  # streamlit-webrtc default
 
-    def recv_audio(self, frame: av.AudioFrame):  # type: ignore[override]
-        self.buf.extend(frame.to_ndarray().tobytes())
-        if time.time() - self.last >= SEGMENT_SEC:
-            wav = _pcm_to_wav(bytes(self.buf), self.rate)
-            threading.Thread(target=_worker, args=(wav,), daemon=True).start()
-            self.buf.clear(); self.last = time.time()
+    def recv_audio(self, frame: "av.AudioFrame"):  # type: ignore[override]
+        pcm16 = frame.to_ndarray().tobytes()
+        self._buf.extend(pcm16)
+
+        # --- compute RMS for level indicator ---
+        samples = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32)
+        rms = float(np.sqrt(np.mean(np.square(samples))) / 32768.0)  # 0‒1
+        try:
+            level_q.put_nowait(rms)
+        except queue.Full:
+            pass
+
+        # --- segment every SEGMENT_SEC seconds ---
+        if time.time() - self._last >= SEGMENT_SEC:
+            wav = pcm_to_wav(bytes(self._buf), self._rate)
+            threading.Thread(target=self._whisper_worker, args=(wav,), daemon=True).start()
+            self._buf.clear()
+            self._last = time.time()
+
         return frame  # passthrough
 
+    # background whisper + Make
+    def _whisper_worker(self, wav: bytes) -> None:
+        try:
+            txt = whisper_transcribe(wav)
+            bullets = post_to_make(txt)
+            result_q.put(bullets)
+        except Exception as e:
+            result_q.put([f"❌ {e}"])
 
-def _pcm_to_wav(pcm: bytes, sr: int) -> bytes:
-    import wave, io as _io
-    b = _io.BytesIO()
-    with wave.open(b, "wb") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(pcm)
-    return b.getvalue()
+# ------------------------------------------------------------------------------
+# UI ----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
+def main() -> None:
+    st.set_page_config(page_title="AI Moderátor", page_icon="📝", layout="centered")
+    st.title("📝 AI Moderátor – audio ➜ bullet‑points")
 
-def _worker(wav: bytes):
-    try:
-        txt = whisper_transcribe(wav)
-        bullets = post_to_make(txt)
-    except Exception as e:
-        bullets = [f"❌ {e}"]
-    _result_q.put(bullets)
-    st.session_state["__new__"] = True
-
-# ---------------------------------------------------------------
-#  UI
-# ---------------------------------------------------------------
-
-def main():
-    global SEGMENT_SEC
-    st.title("📝 AI Moderátor – audio ➜ bullet‑points")
-
-    mode = st.sidebar.radio("Režim", ["Upload", "Live"])
-    SEGMENT_SEC = st.sidebar.slider("Interval odesílání (s)", 15, 180, SEGMENT_SEC, 5)
+    mode = st.sidebar.radio("Režim", ["Upload", "Live"], index=1)
+    seg = st.sidebar.slider("Interval segmentu (s)", 15, 180, SEGMENT_SEC, 5)
+    globals()["SEGMENT_SEC"] = seg
 
     if mode == "Upload":
-        upload_ui(); return
-    live_ui()
+        upload_ui()
+    else:
+        live_ui()
 
+# --------------------------------------------
 
-def upload_ui():
+def upload_ui() -> None:
     f = st.file_uploader("Nahraj audio", type=["wav", "mp3", "m4a"])
     if f and st.button("Zpracovat"):
-        with st.spinner("Whisper → Make…"):
+        with st.spinner("Whisper → Make…"):
             txt = whisper_transcribe(f.read())
             bullets = post_to_make(txt)
         st.subheader("Bullet‑points")
         st.markdown("\n".join(f"• {b}" for b in bullets))
 
+# --------------------------------------------
 
-def live_ui():
+def live_ui() -> None:
     st.markdown("Klikni **Allow** pro mikrofon / virtuální kabel.")
 
     ctx = webrtc_streamer(
         key="live_audio",
         mode=WebRtcMode.SENDONLY,
-        audio_processor_factory=LiveProcessor,
+        audio_processor_factory=LiveAudioProcessor,
         media_stream_constraints={"audio": True, "video": False},
         rtc_configuration={
             "iceServers": [
@@ -135,25 +155,44 @@ def live_ui():
         },
     )
 
-    st.caption(f"WebRTC state: {ctx.state}")
-
-    # periodický refresh jen pokud je k dispozici st_autorefresh
-    st_autorefresh(interval=800, key="__auto")
+    # --- live widgets ---
+    level_placeholder = st.empty()
+    bullet_container = st.container()
 
     if "bullets" not in st.session_state:
         st.session_state["bullets"] = []
 
-    if st.session_state.pop("__new__", False):
-        try:
-            while True:
-                st.session_state["bullets"].extend(_result_q.get_nowait())
-        except queue.Empty:
-            pass
+    # gentle refresh every 700 ms if autorefresh available
+    st_autorefresh(interval=700, key="__auto")
 
-    st.subheader("Živé bullet‑points")
-    blt = st.session_state["bullets"]
-    st.markdown("\n".join(f"• {x}" for x in blt) if blt else "_Čekám na první segment…_")
+    # pull queued results
+    try:
+        while True:
+            st.session_state["bullets"].extend(result_q.get_nowait())
+    except queue.Empty:
+        pass
 
+    # pull latest level (keep last)
+    level = 0.0
+    try:
+        while True:
+            level = level_q.get_nowait()
+    except queue.Empty:
+        pass
 
+    # render level bar (simple text‑based)
+    bar_len = int(level * 20)
+    bar = "🟩" * bar_len + "▫️" * (20 - bar_len)
+    level_placeholder.markdown(f"**Úroveň audia:** {bar}")
+
+    # render bullets
+    bullet_container.subheader("Živé bullet‑points")
+    bullets: List[str] = st.session_state["bullets"]
+    if bullets:
+        bullet_container.markdown("\n".join(f"• {b}" for b in bullets))
+    else:
+        bullet_container.info("Čekám na první segment…")
+
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
